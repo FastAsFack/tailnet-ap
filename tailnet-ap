@@ -339,6 +339,7 @@ fw_apply() {
         iptables)
             for rule in \
                 "-t nat -C POSTROUTING -s $HOSTIP/$PREFIX -o $UP_IF -j MASQUERADE" \
+                "-t nat -C POSTROUTING -s $HOSTIP/$PREFIX -o tailscale0 -j MASQUERADE" \
                 "-C FORWARD -i $AP_IF -o $UP_IF -j ACCEPT" \
                 "-C FORWARD -i $UP_IF -o $AP_IF -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT" \
                 "-C FORWARD -i $AP_IF -o tailscale0 -j ACCEPT" \
@@ -384,6 +385,7 @@ fw_remove() {
         iptables)
             for rule in \
                 "-t nat -D POSTROUTING -s $HOSTIP/$PREFIX -o $UP_IF -j MASQUERADE" \
+                "-t nat -D POSTROUTING -s $HOSTIP/$PREFIX -o tailscale0 -j MASQUERADE" \
                 "-D FORWARD -i $AP_IF -o $UP_IF -j ACCEPT" \
                 "-D FORWARD -i $UP_IF -o $AP_IF -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT" \
                 "-D FORWARD -i $AP_IF -o tailscale0 -j ACCEPT" \
