@@ -7,6 +7,15 @@ changed, and how it was checked. The program prints its own version with
 Versions are `MAJOR.MINOR.PATCH`. `1.1.0` is the first release that runs outside
 Fedora.
 
+## 1.1.3 - 2026-11-21
+
+- **`doctor` compares the advertised route to the network address, not the host
+  address.** The AP host is `10.42.7.1/24`; the advertised route is
+  `10.42.7.0/24`, so the check printed `subnet route none` on a host that was
+  advertising it. It now derives `10.42.7.0` from `HOSTIP`.
+- **`update` adds a cache-buster to the head-commit lookup** so a check run
+  seconds after a push does not read the previous commit's metadata.
+
 ## 1.1.2 - 2026-11-21
 
 - **`update` pins the download to the current commit.** The contents API at

@@ -41,7 +41,7 @@ fi
 # writing NetworkManager profiles stay in the entry scripts, where they read top to bottom.
 
 # ---- names ----
-VERSION=1.1.2
+VERSION=1.1.3
 # The contents API, not raw.githubusercontent.com: the raw CDN served a stale copy
 # for minutes after a push. Even the contents API at ?ref=main is cached, so update
 # first reads the head SHA and pins the file URL to that commit.
@@ -969,10 +969,10 @@ do_update() {
     tmp=$(mktemp /tmp/tailnet-ap.XXXXXX) || die "could not make a temp file"
     local sha url
     if command -v curl >/dev/null 2>&1; then
-        sha=$(curl -fsSL -H "User-Agent: tailnet-ap" "$REPO_API/commits/main" 2>/dev/null \
+        sha=$(curl -fsSL -H "User-Agent: tailnet-ap" "$REPO_API/commits/main?cb=$(date +%s)" 2>/dev/null \
               | python3 -c "import json,sys; print(json.load(sys.stdin).get('sha',''))" 2>/dev/null)
     else
-        sha=$(wget -qO- --header="User-Agent: tailnet-ap" "$REPO_API/commits/main" 2>/dev/null \
+        sha=$(wget -qO- --header="User-Agent: tailnet-ap" "$REPO_API/commits/main?cb=$(date +%s)" 2>/dev/null \
               | python3 -c "import json,sys; print(json.load(sys.stdin).get('sha',''))" 2>/dev/null)
     fi
     if [ -n "$sha" ]; then
@@ -1133,13 +1133,14 @@ do_doctor() {
     printf "  %-12s %s\n" "firewall" "$(fw_backend)"
     printf "  %-12s %s\n" "country" "$COUNTRY"
     printf "  %-12s %s\n" "ap capable" "${ap:-unknown (needs nmcli)}"
-    local routeall adv ap_adv
+    local routeall adv ap_adv ap_net
+    ap_net=${HOSTIP%.*}.0
     routeall=$(tailscale debug prefs 2>/dev/null | grep -o '"RouteAll": [a-z]*' | awk '{print $2}')
     adv=$(tailscale debug prefs 2>/dev/null | python3 -c "import json,sys; d=json.load(sys.stdin); print(','.join(d.get('AdvertiseRoutes') or []))" 2>/dev/null)
     [ -n "$adv" ] || adv=$(tailscale debug prefs 2>/dev/null | grep -o '"AdvertiseRoutes": \[[^]]*\]' | sed 's/.*\[//; s/\].*//')
     printf "  %-12s %s\n" "accept-routes" "${routeall:-unknown}"
     case ",$adv," in
-        *",$HOSTIP/$PREFIX,"*) printf "  %-12s %s\n" "subnet route" "$HOSTIP/$PREFIX"; ap_adv=yes ;;
+        *",$ap_net/$PREFIX,"*) printf "  %-12s %s\n" "subnet route" "$ap_net/$PREFIX"; ap_adv=yes ;;
         *) printf "  %-12s %s\n" "subnet route" "none"; ap_adv=no ;;
     esac
     if [ "${routeall:-}" = false ]; then
