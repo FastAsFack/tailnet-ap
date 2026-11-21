@@ -98,7 +98,12 @@ detect_ifaces() {
     fi
     if [ ! -e "/sys/class/net/$WIFI_IF" ]; then
         for w in /sys/class/net/*; do
-            if [ -e "$w/wireless" ]; then WIFI_IF=$(basename "$w"); break; fi
+            [ -e "$w/wireless" ] || continue
+            # Skip virtual interfaces: ap0 also carries a wireless link, and picking it
+            # here makes every later nmcli call name the AP instead of the radio.
+            [ -e "$w/device" ] || continue
+            WIFI_IF=$(basename "$w")
+            break
         done
     fi
 }
