@@ -55,6 +55,9 @@ COUNTRY=${TAILNET_AP_COUNTRY:-NL}
 # a friend overrides both. TAILNET_AP_HOSTRECORD= (empty) turns the shortcut off.
 DOMAIN=${TAILNET_AP_DOMAIN:-taile8e387.ts.net}
 HOSTRECORD=${TAILNET_AP_HOSTRECORD:-raspberry-server,100.116.252.86}
+# Upstream DNS for dnsmasq. Empty means detect: systemd-resolved (127.0.0.53), else
+# Tailscale's resolver, else the first nameserver in /etc/resolv.conf.
+DNS_UPSTREAM=${TAILNET_AP_DNS:-}
 PSKFILE=/etc/hostapd/tailnet-ap.psk
 NM_CON=tailnet-ap
 UPLINK_CON=tailnet-ap-uplink
@@ -97,6 +100,20 @@ detect_ifaces() {
         for w in /sys/class/net/*; do
             if [ -e "$w/wireless" ]; then WIFI_IF=$(basename "$w"); break; fi
         done
+    fi
+}
+
+# detect_dns_upstream: what dnsmasq forwards to. systemd-resolved when it is listening,
+# otherwise Tailscale's resolver, otherwise the first IPv4 nameserver in resolv.conf.
+detect_dns_upstream() {
+    [ -n "$DNS_UPSTREAM" ] && return 0
+    if ss -lun 2>/dev/null | grep -q '127\.0\.0\.53:53'; then
+        DNS_UPSTREAM=127.0.0.53
+    elif command -v tailscale >/dev/null 2>&1 && tailscale ip -4 >/dev/null 2>&1; then
+        DNS_UPSTREAM=100.100.100.100
+    else
+        DNS_UPSTREAM=$(awk '/^nameserver/ && $2 !~ /:/ {print $2; exit}' /etc/resolv.conf 2>/dev/null)
+        [ -n "$DNS_UPSTREAM" ] || DNS_UPSTREAM=1.1.1.1
     fi
 }
 
@@ -544,6 +561,11 @@ if [ "$MODE" = cable ]; then
 
     say "cable: the cable carries the uplink, so the whole radio can be the AP"
 
+    # NetworkManager can hold the radio soft-disabled (nmcli radio shows WIFI disabled).
+    # The AP cannot start without it, and this does not touch the cable.
+    nmcli radio wifi on >/dev/null 2>&1 || true
+    sleep 1
+
     # Free the radio. One radio cannot hold a client link and an AP on another channel, and
     # "dev disconnect" also stops NetworkManager from taking the device back while the AP is
     # up: it clears the device's autoconnect until something connects it explicitly. The off
@@ -719,6 +741,7 @@ do_toggle() {
 do_install() {
     [ "$(id -u)" -eq 0 ] || die "install needs root: sudo tailnet-ap install"
     detect_desktop_user
+    detect_dns_upstream
     local hostuser=${DESKTOP_USER}
     local t
     for t in hostapd dnsmasq iw; do
@@ -757,7 +780,7 @@ dhcp-range=10.42.7.50,10.42.7.200,255.255.255.0,12h
 dhcp-option=option:router,10.42.7.1
 dhcp-option=option:dns-server,10.42.7.1
 no-resolv
-server=127.0.0.53
+server=$DNS_UPSTREAM
 bogus-priv
 # domain-needed is deliberately NOT set: it makes dnsmasq refuse any name without a
 # dot, so "raspberry-server" never reaches the resolver. Measured 21 Nov 2026.
@@ -1046,6 +1069,7 @@ do_key_set() {
 main() {
     SELF=$(readlink -f "$0")
     detect_ifaces
+    detect_dns_upstream
     detect_desktop_user
     local cmd=${1:-help}
     [ "$#" -gt 0 ] && shift
