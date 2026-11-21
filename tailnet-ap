@@ -806,11 +806,10 @@ bogus-priv
 filter-AAAA
 # domain-needed is deliberately NOT set: it makes dnsmasq refuse any name without a
 # dot, so "raspberry-server" never reaches the resolver. Measured 21 Nov 2026.
-dhcp-option=option:domain-search,$DOMAIN
-domain=$DOMAIN
+# No domain-search: it made Android append taile8e387.ts.net to connectivitycheck and
+# google, get NXDOMAIN, and report "no internet". The host-record covers the bare name.
+host-record=${HOSTRECORD:-raspberry-server,100.116.252.86}
 CONF
-    # Optional static shortcut for clients that ignore the search domain.
-    [ -n "$HOSTRECORD" ] && echo "host-record=$HOSTRECORD" >> /etc/dnsmasq.d/tailnet-ap.conf
 
     local hostapd_bin
     hostapd_bin=$(command -v hostapd || echo /usr/sbin/hostapd)
