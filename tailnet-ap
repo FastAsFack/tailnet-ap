@@ -343,7 +343,7 @@ fw_apply() {
                 "-C INPUT -i $AP_IF -p tcp --dport 53 -j ACCEPT"
             do
                 iptables $rule >/dev/null 2>&1 && continue
-                iptables $(printf '%s' "$rule" | sed 's/ -C / -I /') >/dev/null 2>&1 || true
+                iptables $(printf '%s' "$rule" | sed -e 's/^-C /-I /' -e 's/ -C / -I /') >/dev/null 2>&1 || true
             done
             ;;
         nftables)
@@ -921,7 +921,7 @@ CONF
     printf "  program           : %s\n" "$( [ -x /usr/local/bin/tailnet-ap ] && echo /usr/local/bin/tailnet-ap || echo MISSING)"
     printf "  launcher          : %s\n" "$( [ -x "$desktop/tailnet-ap.desktop" ] && echo present || echo MISSING)"
     printf "  key               : %s characters\n" "$(wc -c < "$PSKFILE")"
-    printf "  firewall          : %s\n" "$(firewall-cmd --list-all --zone=FedoraWorkstation 2>/dev/null | grep -E 'interfaces|masquerade' | tr -d '\n')"
+    printf "  firewall          : %s\n" "$(fw_backend)"
 }
 
 # ---------------- status ----------------
