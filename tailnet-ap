@@ -1,0 +1,870 @@
+#!/bin/bash
+# tailnet-ap - one program for the ThinkPad's wi-fi access point.
+#
+#   tailnet-ap install            lay down the configs and the key (needs root)
+#   tailnet-ap on [--mode cable|wifi]  bring the access point up
+#   tailnet-ap off [--handback]        bring it down
+#   tailnet-ap toggle                  on if it is down, off if it is up
+#   tailnet-ap status                  what is running
+#   tailnet-ap clients                 which devices are on the access point
+#   tailnet-ap key                     print the wi-fi password (needs root)
+#   tailnet-ap key set PASSWORD        replace it (8 to 63 characters)
+#   tailnet-ap help                    this text
+#
+# cable: the cable is the uplink and the whole radio is the access point.
+# wifi:  the wi-fi stays the uplink and the access point shares its channel.
+#
+# Sourced by the test suite: it defines functions and runs nothing. Run as a
+# program: it dispatches the subcommand.
+set -u
+
+# The suite replaces commands with stubs by rewriting PATH, so PATH is only
+# normalised when this file is executed, never when it is sourced.
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+    export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+fi
+
+# ==================== library ====================
+# tailnet-ap-lib.sh - shared names and testable logic for tailnet-ap-on.sh and
+# tailnet-ap-off.sh. Sourced by both, never run on its own.
+#
+# Sourcing this file only sets variables and defines functions. Nothing runs until a
+# function is called, which is what lets tests/run-tests.sh load it safely.
+#
+# What lives here: pure logic, plus what both scripts share (the names, and read-only
+# nmcli helpers, two of which used to be copied into both files), plus the read-only
+# checks the guards against dropping the link are built on.
+# What does not: anything that changes the machine. Stopping services, creating ap0 and
+# writing NetworkManager profiles stay in the entry scripts, where they read top to bottom.
+
+# ---- names ----
+SSID=thinkpad-tailnet
+HOSTIP=10.42.7.1
+PREFIX=24
+UP_IF=enp0s31f6
+WIFI_IF=wlp3s0
+AP_IF=ap0
+PSKFILE=/etc/hostapd/tailnet-ap.psk
+NM_CON=tailnet-ap
+UPLINK_CON=tailnet-ap-uplink
+HOSTAPD_UNIT=tailnet-ap-hostapd
+NMDIR=/etc/NetworkManager/system-connections
+HOSTAPD_CONF=/etc/hostapd/tailnet-ap.conf
+# The person who uses the desktop. NOT SUDO_USER: this machine's admin account is hermes,
+# while the desktop belongs to tijnb, so SUDO_USER puts the launcher and the key copy in
+# the wrong home. Override with TAILNET_AP_USER=name.
+DESKTOP_USER=${TAILNET_AP_USER:-tijnb}
+
+die() { echo "tailnet-ap: $*" >&2; exit 1; }
+say() { printf '%s\n' "$*"; }
+
+# ---- argument parsing ----
+
+# parse_args ARGS...   (tailnet-ap-on.sh)
+# Sets MODE (auto unless a leading --mode names one), MOVE_UPLINK and TOGGLE (yes or no).
+# Only the first argument is checked and only a leading --mode sets the mode, so
+# "--mode wifi --move-uplink" works and "--move-uplink --mode wifi" stays on auto.
+# The mode word itself is not checked here: decide_mode does that.
+parse_args() {
+    local a
+    MODE=auto
+    MOVE_UPLINK=no
+    TOGGLE=no
+    for a in "$@"; do [ "$a" = "--move-uplink" ] && MOVE_UPLINK=yes; done
+    case "${1:-}" in
+        ""|--mode|--toggle|--move-uplink) ;;
+        *) die "unknown argument: $1" ;;
+    esac
+    [ "${1:-}" = "--mode" ] && MODE="${2:-auto}"
+    [ "${1:-}" = "--toggle" ] && TOGGLE=yes
+    return 0
+}
+
+# parse_off_args ARGS...   (tailnet-ap-off.sh)
+# Sets HANDBACK=yes when the first argument is --handback, else no.
+# Any other argument is ignored, as it always has been.
+parse_off_args() {
+    HANDBACK=no
+    [ "${1:-}" = "--handback" ] && HANDBACK=yes
+    return 0
+}
+
+# ---- mode decision ----
+
+# decide_mode REQUESTED
+# Sets MODE to cable or wifi. auto becomes cable when cable_ready succeeds and wifi when
+# it fails. cable_ready is defined by tailnet-ap-on.sh, and is only called for auto
+# because it can wait 10 seconds. a and b are kept as aliases for older commands.
+decide_mode() {
+    case "${1:-}" in
+        auto)  if cable_ready; then MODE=cable; else MODE=wifi; fi ;;
+        a|cable) MODE=cable ;;
+        b|wifi)  MODE=wifi ;;
+        *) die "mode must be cable, wifi or auto" ;;
+    esac
+}
+
+# ---- channels ----
+
+# channel_from_iw: read "iw dev IF info" on stdin, print the channel number, or nothing.
+channel_from_iw() { sed -n 's/.*channel \([0-9]\{1,\}\) (\([0-9]\{1,\}\) MHz).*/\1/p' | head -1; }
+# ch_of: the channel the wi-fi uplink is on right now, or nothing.
+ch_of() { iw dev "$WIFI_IF" info 2>/dev/null | channel_from_iw; }
+
+# the card will only beacon on these: 2.4 GHz channels 1-13 and 5 GHz channels 149-165
+ap_capable() {
+    [ -n "${1:-}" ] && { { [ "$1" -ge 1 ] && [ "$1" -le 13 ]; } || { [ "$1" -ge 149 ] && [ "$1" -le 165 ]; }; }
+}
+
+# hw_mode_for CHANNEL
+# hostapd's hw_mode takes a, b or g. There is no "bg": that value shipped once, and
+# hostapd refused to start on it.
+hw_mode_for() { if [ "$1" -le 14 ]; then echo g; else echo a; fi; }
+
+# ---- hostapd config ----
+
+# hostapd_conf CHANNEL PASSPHRASE: print the hostapd config for an AP on CHANNEL.
+hostapd_conf() {
+    local ch="$1" psk="$2" hw
+    hw=$(hw_mode_for "$ch")
+    echo "# Rewritten by tailnet-ap-on.sh on every start: the channel follows the uplink."
+    echo "interface=$AP_IF"
+    echo "driver=nl80211"
+    echo "ssid=$SSID"
+    echo "hw_mode=$hw"
+    echo "channel=$ch"
+    echo "ieee80211n=1"
+    echo "ieee80211ac=0"
+    echo "wpa=2"
+    echo "wpa_passphrase=$psk"
+    echo "wpa_key_mgmt=WPA-PSK"
+    echo "rsn_pairwise=CCMP"
+    echo "auth_algs=1"
+    echo "ignore_broadcast_ssid=0"
+}
+
+# write_hostapd_conf CHANNEL PASSPHRASE: write that config where the hostapd unit reads
+# it, readable by root only.
+write_hostapd_conf() {
+    hostapd_conf "$1" "$2" > "$HOSTAPD_CONF"
+    chmod 600 "$HOSTAPD_CONF"
+}
+
+# ---- NetworkManager keyfiles (read-only) ----
+
+# psk_stored KEYFILE
+# Succeeds only when KEYFILE carries the wi-fi password itself: a non-empty psk= and no
+# psk-flags= other than 0. Any other flag means the secret lives with an agent (the desktop
+# keyring) or nowhere, and a root script cannot hand it over. A missing or unreadable file
+# fails. Like GKeyFile, it ignores spaces around "=" and reads the last psk= as the value.
+psk_stored() {
+    [ -r "${1:-}" ] || return 1
+    awk '
+        { sub(/^[ \t]+/, "") }
+        /^psk[ \t]*=/       { v = $0; sub(/^psk[ \t]*=[ \t]*/, "", v); psk = v }
+        /^psk-flags[ \t]*=/ { v = $0; sub(/^psk-flags[ \t]*=[ \t]*/, "", v); sub(/[ \t]+$/, "", v)
+                              if (v !~ /^0+$/) bad = 1 }
+        END { exit !(psk != "" && !bad) }
+    ' "$1"
+}
+
+# ---- reading NetworkManager state (read-only, never changes anything) ----
+
+# device_connected DEVICE: read "nmcli -t -f DEVICE,STATE dev status" on stdin and
+# succeed if DEVICE is connected.
+device_connected() { grep -q "^$1:connected"; }
+# con_on_device DEVICE: read "nmcli -t -f NAME,DEVICE con show --active" on stdin and
+# print the first connection on DEVICE.
+con_on_device() { awk -F: -v d="$1" '$2==d {print $1; exit}'; }
+
+wifi_connected() { nmcli -t -f DEVICE,STATE dev status 2>/dev/null | device_connected "$WIFI_IF"; }
+# The guards that keep the live uplink from being deleted compare this to $UPLINK_CON.
+active_con() { nmcli -t -f NAME,DEVICE con show --active 2>/dev/null | con_on_device "$WIFI_IF"; }
+# copy_not_live: the guard before deleting the copy. Succeeds only when nmcli names the
+# connection on $WIFI_IF and it is not $UPLINK_CON. An empty answer (nmcli failed, NM
+# restarting, a D-Bus timeout) proves nothing: taking it for "not the copy" is how the
+# live uplink was deleted once.
+copy_not_live() { local a; a=$(active_con); [ -n "$a" ] && [ "$a" != "$UPLINK_CON" ]; }
+
+# uuid_unless_copy DEVICE: read "nmcli -t -f UUID,DEVICE,NAME con show --active" on stdin
+# and print the UUID of the first connection on DEVICE, or nothing when that connection is
+# $UPLINK_CON. NAME comes last because nmcli escapes a ":" in a name as "\:".
+uuid_unless_copy() {
+    awk -F: -v d="$1" -v c="$UPLINK_CON" \
+        '$2 == d { if (substr($0, length($1) + length($2) + 3) != c) print $1; exit }'
+}
+# orig_uuid: the UUID of the connection on $WIFI_IF, or nothing when it is the 2.4 GHz copy.
+# tailnet-ap-on.sh records it before moving the uplink, so restore_uplink can bring that
+# profile back by UUID instead of letting NetworkManager choose, which picks the copy.
+orig_uuid() { nmcli -t -f UUID,DEVICE,NAME con show --active 2>/dev/null | uuid_unless_copy "$WIFI_IF"; }
+
+# Last line on purpose: the scripts refuse to run unless the whole file was read.
+
+# ==================== access point functions ====================
+ap_is_up() {
+    [ -d "/sys/class/net/$AP_IF" ] && return 0
+    nmcli -t -f NAME con show --active 2>/dev/null | grep -qx "$NM_CON" && return 0
+    return 1
+}
+
+cable_ready() {
+    [ "$(cat "/sys/class/net/$UP_IF/carrier" 2>/dev/null || echo 0)" = "1" ] || return 1
+    # A carrier is not enough: the cable has to have actually got an address, and a default
+    # route through it, because cable mode gives up the wi-fi uplink. The one-line form (-o)
+    # prints "inet"; the brief form (-br) never does, so it could never match.
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        ip -4 -o addr show dev "$UP_IF" 2>/dev/null | grep -q ' inet ' \
+            && ip -4 route show default dev "$UP_IF" 2>/dev/null | grep -q . \
+            && return 0
+        sleep 1
+    done
+    return 1
+}
+
+stop_ap() {
+    systemctl stop "$HOSTAPD_UNIT" >/dev/null 2>&1
+    systemctl stop dnsmasq >/dev/null 2>&1
+    if [ -d "/sys/class/net/$AP_IF" ]; then
+        ip addr flush dev "$AP_IF" >/dev/null 2>&1
+        iw dev "$AP_IF" del >/dev/null 2>&1
+    fi
+}
+
+start_ap_on() {
+    local ch=$1
+    if [ ! -d "/sys/class/net/$AP_IF" ]; then
+        iw dev "$WIFI_IF" interface add "$AP_IF" type __ap >/dev/null 2>&1 \
+            || die "could not create the virtual AP interface $AP_IF"
+    fi
+    ip link set "$AP_IF" up >/dev/null 2>&1
+    ip addr replace "$HOSTIP/$PREFIX" dev "$AP_IF" >/dev/null 2>&1
+
+    # hw_mode follows the channel: g up to 14, a above (hw_mode_for in the library)
+    write_hostapd_conf "$ch" "$PSK"
+    systemctl start "$HOSTAPD_UNIT" >/dev/null 2>&1
+    sleep 4
+    systemctl is-active --quiet "$HOSTAPD_UNIT" \
+        || die "hostapd would not start on channel $ch (see: journalctl -u $HOSTAPD_UNIT)"
+
+    systemctl start dnsmasq >/dev/null 2>&1
+    sleep 2
+}
+
+restore_uplink() {
+    local i
+    # First, whatever happens next: the copy must not win a later reconnect, or come back
+    # at top priority after a reboot.
+    nmcli con modify "$UPLINK_CON" connection.autoconnect no connection.autoconnect-priority 0 >/dev/null 2>&1
+    # A link that is up stays up, whichever profile carries it. A link that is down gets
+    # the profile from before the move, by UUID. "nmcli dev connect" would let
+    # NetworkManager choose, and it would choose the copy that just failed.
+    if ! wifi_connected; then
+        [ -n "$ORIG_UUID" ] && nmcli con up uuid "$ORIG_UUID" ifname "$WIFI_IF" >/dev/null 2>&1
+        for i in $(seq 1 8); do sleep 3; wifi_connected && break; done
+    fi
+    wifi_connected || return 1
+    if copy_not_live; then
+        nmcli con delete "$UPLINK_CON" >/dev/null 2>&1
+    fi
+    return 0
+}
+
+pin_uplink_24() {
+    local uuid src newuuid copyuuid ch
+    if nmcli -t -f NAME con show 2>/dev/null | grep -qx "$UPLINK_CON"; then
+        # The link is about to be dropped for this copy, so it has to be able to log in by
+        # itself. A copy whose password is only in the keyring never connects: that is how
+        # this laptop was locked out the second time.
+        psk_stored "$NMDIR/$UPLINK_CON.nmconnection" \
+            || die "not moving the uplink: the wi-fi password is not stored in $NMDIR/$UPLINK_CON.nmconnection, so it could not log in without the desktop keyring. Store it there first (psk= set, psk-flags=0)."
+        # it already exists: re-pin it rather than deleting, so a live link is never dropped
+        nmcli con modify "$UPLINK_CON" \
+            802-11-wireless.band bg \
+            connection.autoconnect yes \
+            connection.autoconnect-priority 100 >/dev/null 2>&1
+        nmcli con reload >/dev/null 2>&1
+        copyuuid=$(nmcli -g connection.uuid con show "$UPLINK_CON" 2>/dev/null | head -1)
+        [ -n "$copyuuid" ] || die "cannot read the UUID of $UPLINK_CON"
+        nmcli con up uuid "$copyuuid" ifname "$WIFI_IF" >/dev/null 2>&1
+        for _ in $(seq 1 20); do
+            sleep 2
+            if wifi_connected; then
+                ch=$(ch_of)
+                ap_capable "$ch" && return 0
+            fi
+        done
+        return 1
+    fi
+
+    uuid=$(nmcli -t -f UUID,DEVICE con show --active 2>/dev/null \
+           | awk -F: -v d="$WIFI_IF" '$2==d {print $1; exit}')
+    [ -n "$uuid" ] || die "no active connection on $WIFI_IF to base the 2.4 GHz uplink on"
+    src=$(grep -rl "^uuid=$uuid\$" "$NMDIR" 2>/dev/null | head -1)
+    [ -n "$src" ] || die "cannot find the profile file for $uuid"
+
+    cp -f "$src" "$NMDIR/$UPLINK_CON.nmconnection"
+    newuuid=$(cat /proc/sys/kernel/random/uuid)
+    sed -i -e "s/^id=.*/id=$UPLINK_CON/" \
+           -e "s/^uuid=.*/uuid=$newuuid/" \
+           -e "s/^autoconnect=.*/autoconnect=true/" \
+           "$NMDIR/$UPLINK_CON.nmconnection"
+    sed -i "/^channel=/d" "$NMDIR/$UPLINK_CON.nmconnection"
+    grep -q "^\[wifi\]" "$NMDIR/$UPLINK_CON.nmconnection" \
+        && sed -i "/^\[wifi\]/a band=bg" "$NMDIR/$UPLINK_CON.nmconnection"
+    grep -q "^autoconnect-priority" "$NMDIR/$UPLINK_CON.nmconnection" \
+        || sed -i "/^\[connection\]/a autoconnect-priority=100" "$NMDIR/$UPLINK_CON.nmconnection"
+    chmod 600 "$NMDIR/$UPLINK_CON.nmconnection"
+    # Same rule for a new copy, checked before NetworkManager is told about it: no stored
+    # password, no copy, and the live link is not touched.
+    if ! psk_stored "$NMDIR/$UPLINK_CON.nmconnection"; then
+        rm -f "$NMDIR/$UPLINK_CON.nmconnection"
+        nmcli con reload >/dev/null 2>&1
+        die "not moving the uplink: the wi-fi password is not stored in $src, so a copy of it could not log in without the desktop keyring. Store it there first (psk= set, psk-flags=0)."
+    fi
+    nmcli con reload >/dev/null 2>&1
+
+    # By UUID, for the reason in the note above: autoconnect is not deterministic here.
+    nmcli con up uuid "$newuuid" ifname "$WIFI_IF" >/dev/null 2>&1
+    for _ in $(seq 1 20); do
+        sleep 2
+        if wifi_connected; then
+            ch=$(ch_of)
+            ap_capable "$ch" && return 0
+        fi
+    done
+    return 1
+}
+
+# ==================== commands ====================
+do_on() {
+parse_args "$@"
+if [ "$TOGGLE" = yes ] && ap_is_up; then
+    do_off "$@"
+fi
+
+# decide_mode calls this for auto
+
+decide_mode "$MODE"
+
+[ -r "$PSKFILE" ] || die "no key at $PSKFILE"
+PSK=$(cat "$PSKFILE")
+[ -n "$PSK" ] || die "the key file is empty"
+
+
+# start_ap_on CH: everything both modes share once a channel is decided: the virtual AP
+# interface, hostapd and the DHCP/DNS server for the AP subnet. Both modes use this, which
+# is the point: cable mode on a cable must run the same stack a Raspberry Pi would run.
+
+# The profile that was live on wlp3s0 before the move to 2.4 GHz, by UUID, and never the
+# copy. Wifi mode records it just before pin_uplink_24. Cable mode has none.
+ORIG_UUID=""
+
+# Get a link back, and only then let go of the 2.4 GHz copy. Deleting the connection the
+# machine is actually using is what took this laptop off the network once: the keyring
+# holds the password and a root script cannot hand it over.
+
+# Move the uplink to 2.4 GHz by copying the live profile and pinning the band.
+# The original profile is never modified; the copy is removed by the off script.
+# The copy is activated BY UUID, never left to autoconnect: with both profiles offering
+# the same SSID, NetworkManager picked the original and the uplink went straight back to
+# 5 GHz (measured on the real machine, 21 Nov 2026).
+
+stop_ap
+
+if [ "$MODE" = cable ]; then
+    # ---------------- cable mode ----------------
+    if ! cable_ready; then
+        say "cable mode needs a live cable on $UP_IF (carrier, an address and a default route), and there is none."
+        say "Plug the cable in, or run:  $SELF --mode wifi"
+        exit 1
+    fi
+    # A link that is up stays up; this also demotes the 2.4 GHz copy. Cable mode does not need
+    # the wi-fi at all, so a failure here is not fatal: the cable is the uplink.
+    restore_uplink || true
+
+    say "cable: the cable carries the uplink, so the whole radio can be the AP"
+
+    # Free the radio. One radio cannot hold a client link and an AP on another channel, and
+    # "dev disconnect" also stops NetworkManager from taking the device back while the AP is
+    # up: it clears the device's autoconnect until something connects it explicitly. The off
+    # script always tries to give the wi-fi back, so this is not a one-way door.
+    nmcli dev disconnect "$WIFI_IF" >/dev/null 2>&1
+    for _ in $(seq 1 10); do
+        wifi_connected || break
+        sleep 1
+    done
+    if wifi_connected; then
+        nmcli dev connect "$WIFI_IF" >/dev/null 2>&1
+        die "could not let go of $WIFI_IF, so the radio cannot be given to the AP"
+    fi
+
+    # Why not NetworkManager's own hotspot, which is what this mode used to build: its
+    # shared-mode nftables table accepts only established traffic INTO the AP subnet and
+    # rejects the rest, so a tailnet peer reaches the AP host and never a client. Measured
+    # on the real machine 21 Nov 2026. hostapd plus dnsmasq on ap0 is the stack that works,
+    # and the stack a Raspberry Pi would run, which is the point of proving cable mode at all.
+    CH=6
+    start_ap_on "$CH"
+
+    say "mode        : cable, cable is the uplink, wi-fi radio dedicated to the AP"
+    say "uplink      : $UP_IF  $(ip -4 -br addr show "$UP_IF" | awk '{print $3}')"
+    say "ssid        : $SSID"
+    say "ap radio    : channel $CH, 20 MHz, no client link sharing it"
+    say "gateway/dns : $HOSTIP"
+    say "hostapd     : $(systemctl is-active "$HOSTAPD_UNIT")"
+    say "dnsmasq     : $(systemctl is-active dnsmasq)"
+    say "ap0 addr    : $(ip -4 -br addr show "$AP_IF" 2>/dev/null | awk '{print $3}')"
+else
+    # ---------------- wifi mode ----------------
+    wifi_connected || die "$WIFI_IF is not connected, so there is no uplink to ride on"
+
+    CH=$(ch_of)
+    if ! ap_capable "$CH"; then
+        if [ "$MOVE_UPLINK" != yes ]; then
+            say "The uplink is on channel $CH, and this card can only beacon on 2.4 GHz"
+            say "channels 1-13 or 5 GHz channels 149-165. The AP must share the uplink's"
+            say "channel, so there is nothing to start from here."
+            say ""
+            say "Two one-time fixes:"
+            say "  1. put the laptop on the 2.4 GHz band of your network, then run this again"
+            say "  2. let the wi-fi password be stored in the profile file instead of only the"
+            say "     keyring, then run:  $SELF --mode wifi --move-uplink"
+            say ""
+            say "I do not move the uplink by myself: the password lives in the desktop keyring,"
+            say "a root script cannot hand it to NetworkManager, and doing it anyway has already"
+            say "taken this laptop off the network twice."
+            exit 1
+        fi
+        say "uplink is on channel $CH, which this card cannot beacon on. Moving it to 2.4 GHz."
+        # what restore_uplink brings back if the move fails
+        ORIG_UUID=$(orig_uuid)
+        if ! pin_uplink_24; then
+            restore_uplink || say "warning: could not get the wi-fi back, reconnect it by hand"
+            die "could not get the uplink onto a channel the card can beacon on"
+        fi
+        CH=$(ch_of)
+    fi
+    ap_capable "$CH" || die "uplink ended up on channel $CH, still not beaconable"
+
+    start_ap_on "$CH"
+
+    say "mode        : wifi, wi-fi is the uplink and the AP rides its channel"
+    say "uplink      : $WIFI_IF on channel $CH"
+    say "ssid        : $SSID"
+    say "ap radio    : channel $CH, 20 MHz"
+    say "gateway/dns : $HOSTIP"
+    say "hostapd     : $(systemctl is-active "$HOSTAPD_UNIT")"
+    say "dnsmasq     : $(systemctl is-active dnsmasq)"
+    say "ap0 addr    : $(ip -4 -br addr show "$AP_IF" 2>/dev/null | awk '{print $3}')"
+fi
+
+# Tell the tailnet the AP subnet exists, so approved clients can reach 100.x peers.
+# The first time this needs approving in the admin console; after that it is remembered.
+# Advertising without approval is harmless: the route simply stays unapproved.
+# This program does not install Tailscale: it is a separate client that has to be
+# installed and logged in first. Without it the AP still works, but clients only
+# reach this host, not the rest of the tailnet.
+if ! command -v tailscale >/dev/null 2>&1; then
+    say "route       : tailscale is NOT installed, so clients cannot reach the tailnet"
+    say "              install it first:  dnf install tailscale && tailscale up"
+elif tailscale set --advertise-routes=10.42.7.0/24 >/dev/null 2>&1; then
+    say "route       : 10.42.7.0/24 advertised to the tailnet"
+else
+    say "route       : could not advertise 10.42.7.0/24 (is tailscale up?)"
+fi
+
+unset PSK 2>/dev/null || true
+say "key         : run 'tailnet-ap key' to show it"
+}
+
+do_off() {
+parse_off_args "$@"
+
+systemctl stop "$HOSTAPD_UNIT" >/dev/null 2>&1 && echo "hostapd stopped"
+systemctl stop dnsmasq >/dev/null 2>&1 && echo "dnsmasq stopped"
+
+if [ -d "/sys/class/net/$AP_IF" ]; then
+    ip addr flush dev "$AP_IF" >/dev/null 2>&1
+    iw dev "$AP_IF" del >/dev/null 2>&1 && echo "$AP_IF removed"
+fi
+
+if nmcli -t -f NAME con show 2>/dev/null | grep -qx "$NM_CON"; then
+    nmcli con down "$NM_CON" >/dev/null 2>&1
+    nmcli con delete "$NM_CON" >/dev/null 2>&1 && echo "hotspot profile deleted"
+fi
+
+if nmcli -t -f NAME con show 2>/dev/null | grep -qx "$UPLINK_CON"; then
+    if [ "$HANDBACK" = yes ]; then
+        echo "handing the uplink back to its normal profile..."
+        nmcli con modify "$UPLINK_CON" connection.autoconnect no connection.autoconnect-priority 0 >/dev/null 2>&1
+        nmcli dev disconnect "$WIFI_IF" >/dev/null 2>&1
+        sleep 3
+        nmcli dev connect "$WIFI_IF" >/dev/null 2>&1
+        ok=""
+        for _ in $(seq 1 12); do
+            sleep 3
+            # copy_not_live, not a bare "!=": an empty answer from nmcli is not "not the copy"
+            if wifi_connected && copy_not_live; then ok=yes; break; fi
+        done
+        if [ -n "$ok" ]; then
+            nmcli con delete "$UPLINK_CON" >/dev/null 2>&1 && echo "2.4 GHz uplink copy removed"
+        else
+            echo "handback did not take. Putting the 2.4 GHz copy back so the link stays up."
+            nmcli con modify "$UPLINK_CON" connection.autoconnect yes connection.autoconnect-priority 100 >/dev/null 2>&1
+            nmcli dev disconnect "$WIFI_IF" >/dev/null 2>&1
+            sleep 2
+            nmcli dev connect "$WIFI_IF" >/dev/null 2>&1
+            for _ in $(seq 1 12); do sleep 3; wifi_connected && break; done
+        fi
+    else
+        # leave the live link alone, only stop the copy winning the next reconnect
+        nmcli con modify "$UPLINK_CON" connection.autoconnect no connection.autoconnect-priority 0 >/dev/null 2>&1
+        if [ "$(active_con)" = "$UPLINK_CON" ]; then
+            echo "note: your wi-fi is still on the 2.4 GHz copy, which is the safe state."
+            echo "      It returns to normal on the next reconnect, or run:  $SELF --handback"
+        fi
+    fi
+fi
+
+# The AP is gone. In cable mode the radio was taken away from the wi-fi client by design, so
+# give it back: after this, the laptop must never be left with no wireless at all. In wifi mode
+# the uplink is the wi-fi itself and is still connected, so this is a no-op.
+if ! wifi_connected; then
+    echo "giving the wi-fi back"
+    nmcli dev connect "$WIFI_IF" >/dev/null 2>&1
+    for _ in $(seq 1 10); do
+        wifi_connected && break
+        sleep 3
+        nmcli dev connect "$WIFI_IF" >/dev/null 2>&1
+    done
+    wifi_connected || echo "warning: the wi-fi did not come back by itself. Run:  nmcli dev connect $WIFI_IF"
+fi
+
+echo "tailnet AP is down."
+nmcli -t -f DEVICE,STATE,CONNECTION dev status | grep -E "^($WIFI_IF|$AP_IF|enp0s31f6):"
+iw dev "$WIFI_IF" link 2>/dev/null | grep -E "SSID|freq"
+}
+
+do_toggle() {
+    if ap_is_up; then
+        do_off
+    else
+        do_on
+    fi
+}
+
+# ---------------- install ----------------
+# Lays down what the access point needs on disk. Mirrors the tested deploy.sh:
+# the same four drop-ins, the same firewall changes, the same key handling.
+do_install() {
+    [ "$(id -u)" -eq 0 ] || die "install needs root: sudo tailnet-ap install"
+    local hostuser=${DESKTOP_USER}
+    local userhome desktop
+    userhome=$(getent passwd "$hostuser" | cut -d: -f6)
+    [ -n "$userhome" ] || die "no home directory for $hostuser"
+    desktop="$userhome/Desktop"
+
+    say "install: static pieces"
+    install -d -m 755 /etc/NetworkManager/conf.d /etc/dnsmasq.d /etc/hostapd
+
+    cat > /etc/NetworkManager/conf.d/99-tailnet-ap.conf <<'CONF'
+# Leave the virtual AP interface to hostapd. NetworkManager must not manage ap0.
+[keyfile]
+unmanaged-devices=interface-name:ap0
+CONF
+
+    cat > /etc/dnsmasq.d/tailnet-ap.conf <<'CONF'
+# DHCP and DNS for clients on the virtual AP interface ap0.
+interface=ap0
+bind-dynamic
+dhcp-range=10.42.7.50,10.42.7.200,255.255.255.0,12h
+dhcp-option=option:router,10.42.7.1
+dhcp-option=option:dns-server,10.42.7.1
+no-resolv
+server=127.0.0.53
+bogus-priv
+# domain-needed is deliberately NOT set: it makes dnsmasq refuse any name without a
+# dot, so "raspberry-server" never reaches the resolver. Measured 21 Nov 2026.
+dhcp-option=option:domain-search,taile8e387.ts.net
+domain=taile8e387.ts.net
+# Static shortcut so the bare name works for clients that ignore the search domain.
+host-record=raspberry-server,100.116.252.86
+CONF
+
+    cat > /etc/systemd/system/tailnet-ap-hostapd.service <<'CONF'
+[Unit]
+Description=hostapd for the tailnet AP (thinkpad-tailnet)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/hostapd /etc/hostapd/tailnet-ap.conf
+Restart=no
+
+[Install]
+WantedBy=multi-user.target
+CONF
+
+    cat > /etc/sysctl.d/60-tailnet-ap.conf <<'CONF'
+# Tailnet AP: let clients on 10.42.7.0/24 be routed to the tailnet and out.
+net.ipv4.ip_forward = 1
+CONF
+
+    chmod 644 /etc/NetworkManager/conf.d/99-tailnet-ap.conf \
+              /etc/dnsmasq.d/tailnet-ap.conf \
+              /etc/systemd/system/tailnet-ap-hostapd.service \
+              /etc/sysctl.d/60-tailnet-ap.conf
+    sysctl --system >/dev/null 2>&1 || true
+
+    say "install: firewall"
+    # Reload first. --permanent reads the daemon's in-memory copy, not the file on disk,
+    # so after /etc was restored the daemon still held the old config: every add answered
+    # ALREADY_ENABLED and wrote nothing, and the reload at the end then dropped them all.
+    # Measured 21 Nov 2026.
+    firewall-cmd --reload >/dev/null 2>&1 || true
+    firewall-cmd --permanent --zone=FedoraWorkstation --add-interface=ap0 >/dev/null
+    # tailscale0 must sit in the same zone as ap0. Without it the zone's forward
+    # chain has no rule for the tailnet interface and drops every packet from the
+    # AP into the tailnet. Measured 21 Nov 2026: phone -> peer failed.
+    firewall-cmd --permanent --zone=FedoraWorkstation --add-interface=tailscale0 >/dev/null
+    firewall-cmd --permanent --zone=FedoraWorkstation --add-masquerade >/dev/null
+    # Without dhcp and dns the AP looks healthy and cannot work: clients associate,
+    # authenticate, then get no address because udp 67/68 is dropped before dnsmasq.
+    firewall-cmd --permanent --zone=FedoraWorkstation --add-service=dhcp >/dev/null
+    firewall-cmd --permanent --zone=FedoraWorkstation --add-service=dns >/dev/null
+    firewall-cmd --reload >/dev/null
+
+    # Prove it landed instead of trusting the warnings. A silent ALREADY_ENABLED leaves
+    # the zone empty after the reload, and the AP then associates but cannot route.
+    _fw=$(firewall-cmd --permanent --zone=FedoraWorkstation --list-all 2>/dev/null)
+    for _want in ap0 tailscale0; do
+        printf '%s\n' "$_fw" | grep -qE "^[[:space:]]*interfaces:.*\b$_want\b" \
+            || say "  WARNING: $_want is not in the FedoraWorkstation zone"
+    done
+    printf '%s\n' "$_fw" | grep -q 'masquerade: yes' \
+        || say "  WARNING: masquerade is off in the FedoraWorkstation zone"
+
+    systemctl daemon-reload
+    nmcli general reload >/dev/null 2>&1 || true
+
+    say "install: checking tailscale"
+    # Tailscale is NOT installed by this program. It is a separate client, and without
+    # it the AP still works but clients cannot reach the tailnet.
+    if command -v tailscale >/dev/null 2>&1; then
+        say "  tailscale present"
+    else
+        say "  WARNING: tailscale is not installed"
+        say "           clients would reach this host only, not the tailnet"
+        say "           install it first:  dnf install tailscale && tailscale up"
+    fi
+
+    say "install: network key"
+    if [ -s "$PSKFILE" ]; then
+        say "  keeping the existing key ($(wc -c < "$PSKFILE") characters)"
+    else
+        umask 077
+        # 10 characters, as asked for on 21 Nov 2026. Still about 59 bits of randomness
+        # from a full alphanumeric set, and long enough for WPA2's 8-character minimum.
+        head -c 48 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 10 > "$PSKFILE"
+        chmod 600 "$PSKFILE"
+        say "  new key written ($(wc -c < "$PSKFILE") characters, never printed)"
+    fi
+    # No copy of the key in the user's home: one secret, one place. Show it on demand
+    # with 'tailnet-ap key', which needs root.
+
+    say "install: the program"
+    # Re-running install from the installed copy must not try to copy a file onto itself.
+    if [ "$(readlink -f "$SELF")" = "/usr/local/bin/tailnet-ap" ]; then
+        say "  already at /usr/local/bin/tailnet-ap"
+    else
+        install -m 755 "$SELF" /usr/local/bin/tailnet-ap
+        say "  /usr/local/bin/tailnet-ap"
+    fi
+
+    say "install: the Desktop launcher"
+    install -d -m 755 -o "$hostuser" -g "$hostuser" "$desktop"
+    cat > "$desktop/tailnet-ap.desktop" <<CONF
+[Desktop Entry]
+Type=Application
+Name=Tailnet AP
+Name[nl]=Tailnet AP
+Comment=Turn the tailnet access point on or off
+Comment[nl]=Zet het tailnet-toegangspunt aan of uit
+Exec=/usr/local/bin/tailnet-ap toggle
+Icon=network-wireless
+Terminal=true
+Categories=Network;
+CONF
+    chmod 755 "$desktop/tailnet-ap.desktop"
+    chown "$hostuser:$hostuser" "$desktop/tailnet-ap.desktop"
+
+    echo
+    say "verification"
+    printf "  ip_forward        : %s\n" "$(sysctl -n net.ipv4.ip_forward)"
+    printf "  dnsmasq drop-in   : %s\n" "$( [ -r /etc/dnsmasq.d/tailnet-ap.conf ] && echo present || echo MISSING)"
+    printf "  hostapd unit      : %s\n" "$( [ -r /etc/systemd/system/tailnet-ap-hostapd.service ] && echo present || echo MISSING)"
+    printf "  program           : %s\n" "$( [ -x /usr/local/bin/tailnet-ap ] && echo /usr/local/bin/tailnet-ap || echo MISSING)"
+    printf "  launcher          : %s\n" "$( [ -x "$desktop/tailnet-ap.desktop" ] && echo present || echo MISSING)"
+    printf "  key               : %s characters\n" "$(wc -c < "$PSKFILE")"
+    printf "  firewall          : %s\n" "$(firewall-cmd --list-all --zone=FedoraWorkstation 2>/dev/null | grep -E 'interfaces|masquerade' | tr -d '\n')"
+}
+
+# ---------------- status ----------------
+# svc_state UNIT: active/inactive/failed, or "unknown" when systemd cannot answer.
+# systemctl is-active prints its answer and then exits non-zero, so a plain "|| echo"
+# would print the word twice. Take the first line, and only fall back when it is empty.
+svc_state() {
+    local s
+    s=$(systemctl is-active "$1" 2>/dev/null | head -1)
+    printf '%s' "${s:-unknown}"
+}
+
+do_status() {
+    local up=no ap_addr uplink
+    ap_is_up && up=yes
+    ap_addr=$(ip -4 -br addr show "$AP_IF" 2>/dev/null | awk '{print $3}')
+    uplink=$(nmcli -t -f DEVICE,STATE,CONNECTION dev status 2>/dev/null \
+             | awk -F: '$2=="connected"{print $1" ("$3")"}' | paste -sd', ' -)
+    printf "%-20s %s\n" "access point" "$up"
+    printf "%-20s %s\n" "hostapd" "$(svc_state "$HOSTAPD_UNIT")"
+    printf "%-20s %s\n" "dnsmasq" "$(svc_state dnsmasq)"
+    printf "%-20s %s\n" "ap0" "${ap_addr:-none}"
+    printf "%-20s %s\n" "ssid" "$SSID"
+    printf "%-20s %s\n" "uplink" "${uplink:-none}"
+    printf "%-20s %s\n" "key" "$PSKFILE"
+}
+
+# ---------------- clients ----------------
+# do_clients: who is on the access point right now. Joins the stations hostapd knows
+# about (MAC, signal, traffic) with the dnsmasq leases (IP, host name) by MAC.
+do_clients() {
+    [ "$(id -u)" -eq 0 ] || die "clients needs root. Run: sudo tailnet-ap clients"
+    if ! ap_is_up; then
+        say "the access point is not running"
+        return 0
+    fi
+    local leases=/var/lib/dnsmasq/dnsmasq.leases count
+    count=$(iw dev "$AP_IF" station dump 2>/dev/null | grep -c '^Station' || true)
+    say "clients on $SSID ($AP_IF)"
+    if [ "${count:-0}" -eq 0 ]; then
+        say "  no clients connected"
+        return 0
+    fi
+    printf "  %-17s %-15s %-22s %-9s %s\n" "MAC" "IP" "HOST" "SIGNAL" "TRAFFIC"
+    awk -v leases="$leases" '
+        BEGIN {
+            while ((getline line < leases) > 0) {
+                split(line, f, " ")
+                if (f[2] != "") { lip[f[2]] = f[3]; lhost[f[2]] = f[4] }
+            }
+            close(leases)
+        }
+        /^Station / { mac=$2; sig=""; rx=""; tx="" }
+        /signal:/ && !/avg/ { sig=$2 }
+        /rx bytes:/ { rx=$3 }
+        /tx bytes:/ { tx=$3 }
+        /^$/ {
+            if (mac != "") {
+                printf "  %-17s %-15s %-22s %-9s %s\n", mac, (lip[mac]?lip[mac]:"-"), (lhost[mac]?lhost[mac]:"-"), (sig?sig" dBm":"-"), (rx?rx"/"tx:"-")
+                mac=""
+            }
+        }
+        END {
+            if (mac != "") printf "  %-17s %-15s %-22s %-9s %s\n", mac, (lip[mac]?lip[mac]:"-"), (lhost[mac]?lhost[mac]:"-"), (sig?sig" dBm":"-"), (rx?rx"/"tx:"-")
+        }
+    ' <(iw dev "$AP_IF" station dump 2>/dev/null; echo)
+}
+
+
+# do_key [set PASSWORD]
+# With no argument, print the current password. With "set PASSWORD", replace it.
+# The key is the tailnet's front door, so this needs root like the rest.
+do_key() {
+    case "${1:-}" in
+        "")  [ -r "$PSKFILE" ] || die "no key at $PSKFILE (run: tailnet-ap install)"
+             cat "$PSKFILE" ;;
+        set) do_key_set "${2:-}" ;;
+        *)   die "usage: tailnet-ap key [set PASSWORD]" ;;
+    esac
+}
+
+# do_key_set PASSWORD: replace the access point password.
+# WPA2 takes 8 to 63 characters. Spaces and quotes are refused because the passphrase is
+# written into the hostapd config as wpa_passphrase=..., where a newline or a quote would
+# break the file or the parser. The file is the only source of truth: every 'on' rewrites
+# the config from it.
+do_key_set() {
+    local newkey=${1:-}
+    [ -n "$newkey" ] || die "usage: tailnet-ap key set PASSWORD"
+    case "$newkey" in
+        *[[:space:]\'\"]*) die "the password cannot contain spaces or quotes" ;;
+    esac
+    [ "${#newkey}" -ge 8 ]  || die "the password must be at least 8 characters"
+    [ "${#newkey}" -le 63 ] || die "the password must be at most 63 characters"
+
+    umask 077
+    printf '%s' "$newkey" > "$PSKFILE"
+    chmod 600 "$PSKFILE"
+    say "key changed (${#newkey} characters)"
+
+    # No copy in the desktop user's home: one secret, one place. Show it on demand
+    # with 'tailnet-ap key', which needs root.
+
+    # If the AP is up, rebuild the config and restart hostapd so the new key takes effect.
+    if systemctl is-active "$HOSTAPD_UNIT" >/dev/null 2>&1; then
+        local ch
+        ch=$(sed -n 's/^channel=//p' "$HOSTAPD_CONF" 2>/dev/null | head -1)
+        [ -n "$ch" ] || ch=6
+        write_hostapd_conf "$ch" "$newkey"
+        if systemctl restart "$HOSTAPD_UNIT" >/dev/null 2>&1; then
+            say "hostapd restarted on channel $ch"
+        else
+            say "WARNING: hostapd did not restart cleanly"
+        fi
+        say "devices have to join again with the new password"
+    else
+        say "the AP is down; the new key is used on the next 'tailnet-ap on'"
+    fi
+}
+
+# ---------------- dispatch ----------------
+main() {
+    SELF=$(readlink -f "$0")
+    local cmd=${1:-help}
+    [ "$#" -gt 0 ] && shift
+    case "$cmd" in
+        install)              do_install ;;
+        on)                   do_on "$@" ;;
+        off)                  do_off "$@" ;;
+        toggle)               do_toggle ;;
+        status)               do_status ;;
+        clients)              do_clients ;;
+        key)                  do_key "$@" ;;
+        help|-h|--help)       awk 'NR>1 { if (/^#/) { sub(/^# ?/, ""); print; next }
+                                          if (/^$/) { print ""; next }
+                                          exit }' "$0" ;;
+        *)                    die "unknown command: $cmd (try: tailnet-ap help)" ;;
+    esac
+}
+
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+    SELF=$(readlink -f "$0")
+    # help and status only read. Everything else changes the machine and needs root.
+    case "${1:-help}" in
+        help|-h|--help|status) main "$@"; exit 0 ;;
+        install|on|off|toggle|key|clients) ;;
+        *) die "unknown command: ${1:-} (try: tailnet-ap help)" ;;
+    esac
+# ---- root, via pkexec when launched from the desktop ----
+if [ "$(id -u)" -ne 0 ]; then
+    if command -v pkexec >/dev/null 2>&1; then exec pkexec "$SELF" "$@"; fi
+    die "needs root. Run:  sudo $SELF"
+fi
+# From here on a dying session (SSH over this same link), Ctrl-C or a TERM must not stop
+# the program between dropping the uplink and getting it back. Ignored signals stay
+# ignored in nmcli, sleep and everything else. This is why the trap sits here and not
+# higher up: the test suite sources this file and must keep its own signal handling.
+trap '' HUP INT TERM
+    main "$@"
+fi
+TAILNET_AP_LIB_LOADED=yes
