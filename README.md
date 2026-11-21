@@ -17,10 +17,36 @@ Normal internet keeps leaving through the laptop's own uplink.
 
 ## Requirements
 
-- Fedora with NetworkManager, `hostapd`, `dnsmasq` and `firewalld`.
+- Linux with `hostapd`, `dnsmasq`, `iw` and either `firewalld` (Fedora) or `iptables`
+  (Raspberry Pi OS / Debian).
+- NetworkManager is used when present. Without it, cable mode still works; Wi-Fi mode
+  needs `nmcli` to manage the uplink.
 - Tailscale installed and running. The program does **not** install Tailscale.
 - A Wi-Fi card that supports AP mode.
 - Root for `install`, `on`, `off`, `toggle`, `clients` and `key`.
+
+Run `tailnet-ap doctor` on a new machine. It lists the interfaces it found and every
+tool that is present or missing.
+
+## Raspberry Pi
+
+The same file runs on a Pi 3B+ or newer. It detects `eth0` / `wlan0` by itself and uses
+`iptables` when `firewalld` is not installed.
+
+```bash
+sudo apt update
+sudo apt install -y hostapd dnsmasq iptables iw
+tailnet-ap doctor                 # hostapd, dnsmasq, iw present; ap capable yes
+sudo tailnet-ap install
+sudo tailnet-ap on --mode cable
+```
+
+Pi notes:
+- Use `--mode cable`. The single radio is then free for the AP. `--mode wifi` also
+  works, but the AP must share the uplink's channel.
+- If the radio refuses to start, set the country: `sudo TAILNET_AP_COUNTRY=NL
+  ./tailnet-ap install`. `doctor` shows which country is in use.
+- The 3B+ radio can beacon on 2.4 GHz reliably. If 5 GHz refuses, stay on 2.4 GHz.
 
 ## Install
 

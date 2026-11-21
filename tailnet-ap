@@ -7,6 +7,7 @@
 #   tailnet-ap toggle                  on if it is down, off if it is up
 #   tailnet-ap status                  what is running
 #   tailnet-ap clients                 which devices are on the access point
+#   tailnet-ap doctor                  check this machine for what the AP needs
 #   tailnet-ap key                     print the wi-fi password (needs root)
 #   tailnet-ap key set PASSWORD        replace it (8 to 63 characters)
 #   tailnet-ap help                    this text
@@ -41,9 +42,15 @@ fi
 SSID=thinkpad-tailnet
 HOSTIP=10.42.7.1
 PREFIX=24
-UP_IF=enp0s31f6
-WIFI_IF=wlp3s0
+# Interface names differ by machine: enp0s31f6 / wlp3s0 on the ThinkPad, eth0 / wlan0 on
+# a Raspberry Pi. These defaults are the ThinkPad's; detect_ifaces() swaps in the real
+# ones when those names are not present. Override with TAILNET_AP_UPLINK / TAILNET_AP_WIFI.
+UP_IF=${TAILNET_AP_UPLINK:-enp0s31f6}
+WIFI_IF=${TAILNET_AP_WIFI:-wlp3s0}
 AP_IF=ap0
+# Regulatory country for hostapd. A Pi often has no country set and then hostapd refuses
+# the radio. Override with TAILNET_AP_COUNTRY.
+COUNTRY=${TAILNET_AP_COUNTRY:-NL}
 PSKFILE=/etc/hostapd/tailnet-ap.psk
 NM_CON=tailnet-ap
 UPLINK_CON=tailnet-ap-uplink
@@ -57,6 +64,37 @@ DESKTOP_USER=${TAILNET_AP_USER:-tijnb}
 
 die() { echo "tailnet-ap: $*" >&2; exit 1; }
 say() { printf '%s\n' "$*"; }
+
+# pkg_hint PACKAGE...: the install command for this distro, for the error messages.
+pkg_hint() {
+    if command -v dnf >/dev/null 2>&1; then echo "dnf install $*"
+    elif command -v apt-get >/dev/null 2>&1; then echo "apt install $*"
+    else echo "install $* with your package manager"
+    fi
+}
+
+# detect_ifaces: swap in the real interface names when the compiled-in defaults are not
+# on this machine. Runs once from main, before any command needs them.
+detect_ifaces() {
+    local d w
+    if [ ! -e "/sys/class/net/$UP_IF" ]; then
+        # Prefer a wired interface for the uplink: a Pi may default-route over wlan0,
+        # but cable mode means the cable.
+        for d in /sys/class/net/eth* /sys/class/net/en*; do
+            [ -e "$d" ] && { UP_IF=$(basename "$d"); break; }
+        done
+    fi
+    if [ ! -e "/sys/class/net/$UP_IF" ]; then
+        d=$(ip route show default 2>/dev/null \
+            | awk '/default/ {for (i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}')
+        [ -n "$d" ] && UP_IF="$d"
+    fi
+    if [ ! -e "/sys/class/net/$WIFI_IF" ]; then
+        for w in /sys/class/net/*; do
+            if [ -e "$w/wireless" ]; then WIFI_IF=$(basename "$w"); break; fi
+        done
+    fi
+}
 
 # ---- argument parsing ----
 
@@ -130,6 +168,7 @@ hostapd_conf() {
     echo "# Rewritten by tailnet-ap-on.sh on every start: the channel follows the uplink."
     echo "interface=$AP_IF"
     echo "driver=nl80211"
+    echo "country_code=$COUNTRY"
     echo "ssid=$SSID"
     echo "hw_mode=$hw"
     echo "channel=$ch"
@@ -221,7 +260,67 @@ cable_ready() {
     return 1
 }
 
+# ---- firewall ----
+# fw_backend: who manages the firewall here. firewalld on Fedora, iptables on a plain
+# Raspberry Pi OS install, none when neither is present.
+fw_backend() {
+    if command -v firewall-cmd >/dev/null 2>&1; then echo firewalld
+    elif command -v iptables >/dev/null 2>&1; then echo iptables
+    else echo none
+    fi
+}
+
+# fw_zone: the firewalld zone that carries the uplink. Fedora puts it in
+# FedoraWorkstation; another distro puts it wherever its default zone is.
+fw_zone() {
+    [ -n "${TAILNET_AP_ZONE:-}" ] && { echo "$TAILNET_AP_ZONE"; return; }
+    local z
+    z=$(firewall-cmd --get-zone-of-interface="$UP_IF" 2>/dev/null)
+    if [ -n "$z" ] && [ "$z" != "no zone" ]; then echo "$z"; return; fi
+    z=$(firewall-cmd --get-default-zone 2>/dev/null)
+    [ -n "$z" ] && echo "$z" || echo FedoraWorkstation
+}
+
+# fw_apply: open the AP path when firewalld is not the manager. Idempotent: -C checks
+# first, so running it twice does not stack rules.
+fw_apply() {
+    [ "$(fw_backend)" = iptables ] || return 0
+    local rule
+    for rule in \
+        "-t nat -C POSTROUTING -s $HOSTIP/$PREFIX -o $UP_IF -j MASQUERADE" \
+        "-C FORWARD -i $AP_IF -o $UP_IF -j ACCEPT" \
+        "-C FORWARD -i $UP_IF -o $AP_IF -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT" \
+        "-C FORWARD -i $AP_IF -o tailscale0 -j ACCEPT" \
+        "-C FORWARD -i tailscale0 -o $AP_IF -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT" \
+        "-C INPUT -i $AP_IF -p udp --dport 67 -j ACCEPT" \
+        "-C INPUT -i $AP_IF -p udp --dport 53 -j ACCEPT" \
+        "-C INPUT -i $AP_IF -p tcp --dport 53 -j ACCEPT"
+    do
+        iptables $rule >/dev/null 2>&1 && continue
+        iptables $(printf '%s' "$rule" | sed 's/ -C / -A /') >/dev/null 2>&1 || true
+    done
+}
+
+# fw_remove: drop the same rules, so off leaves no open door behind.
+fw_remove() {
+    [ "$(fw_backend)" = iptables ] || return 0
+    local rule
+    for rule in \
+        "-t nat -D POSTROUTING -s $HOSTIP/$PREFIX -o $UP_IF -j MASQUERADE" \
+        "-D FORWARD -i $AP_IF -o $UP_IF -j ACCEPT" \
+        "-D FORWARD -i $UP_IF -o $AP_IF -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT" \
+        "-D FORWARD -i $AP_IF -o tailscale0 -j ACCEPT" \
+        "-D FORWARD -i tailscale0 -o $AP_IF -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT" \
+        "-D INPUT -i $AP_IF -p udp --dport 67 -j ACCEPT" \
+        "-D INPUT -i $AP_IF -p udp --dport 53 -j ACCEPT" \
+        "-D INPUT -i $AP_IF -p tcp --dport 53 -j ACCEPT"
+    do
+        iptables $rule >/dev/null 2>&1 || true
+    done
+}
+
 stop_ap() {
+    fw_remove
     systemctl stop "$HOSTAPD_UNIT" >/dev/null 2>&1
     systemctl stop dnsmasq >/dev/null 2>&1
     if [ -d "/sys/class/net/$AP_IF" ]; then
@@ -248,6 +347,7 @@ start_ap_on() {
 
     systemctl start dnsmasq >/dev/null 2>&1
     sleep 2
+    fw_apply
 }
 
 restore_uplink() {
@@ -466,7 +566,7 @@ fi
 # reach this host, not the rest of the tailnet.
 if ! command -v tailscale >/dev/null 2>&1; then
     say "route       : tailscale is NOT installed, so clients cannot reach the tailnet"
-    say "              install it first:  dnf install tailscale && tailscale up"
+    say "              install it first:  $(pkg_hint tailscale) && tailscale up"
 elif tailscale set --advertise-routes=10.42.7.0/24 >/dev/null 2>&1; then
     say "route       : 10.42.7.0/24 advertised to the tailnet"
 else
@@ -565,13 +665,18 @@ do_install() {
     desktop="$userhome/Desktop"
 
     say "install: static pieces"
-    install -d -m 755 /etc/NetworkManager/conf.d /etc/dnsmasq.d /etc/hostapd
+    install -d -m 755 /etc/dnsmasq.d /etc/hostapd
 
-    cat > /etc/NetworkManager/conf.d/99-tailnet-ap.conf <<'CONF'
+    if command -v nmcli >/dev/null 2>&1; then
+        install -d -m 755 /etc/NetworkManager/conf.d
+        cat > /etc/NetworkManager/conf.d/99-tailnet-ap.conf <<'CONF'
 # Leave the virtual AP interface to hostapd. NetworkManager must not manage ap0.
 [keyfile]
 unmanaged-devices=interface-name:ap0
 CONF
+    else
+        say "  no NetworkManager: skipping the ap0 unmanaged rule"
+    fi
 
     cat > /etc/dnsmasq.d/tailnet-ap.conf <<'CONF'
 # DHCP and DNS for clients on the virtual AP interface ap0.
@@ -610,39 +715,53 @@ CONF
 net.ipv4.ip_forward = 1
 CONF
 
-    chmod 644 /etc/NetworkManager/conf.d/99-tailnet-ap.conf \
-              /etc/dnsmasq.d/tailnet-ap.conf \
+    chmod 644 /etc/dnsmasq.d/tailnet-ap.conf \
               /etc/systemd/system/tailnet-ap-hostapd.service \
               /etc/sysctl.d/60-tailnet-ap.conf
+    [ -f /etc/NetworkManager/conf.d/99-tailnet-ap.conf ] \
+        && chmod 644 /etc/NetworkManager/conf.d/99-tailnet-ap.conf
     sysctl --system >/dev/null 2>&1 || true
 
-    say "install: firewall"
-    # Reload first. --permanent reads the daemon's in-memory copy, not the file on disk,
-    # so after /etc was restored the daemon still held the old config: every add answered
-    # ALREADY_ENABLED and wrote nothing, and the reload at the end then dropped them all.
-    # Measured 21 Nov 2026.
-    firewall-cmd --reload >/dev/null 2>&1 || true
-    firewall-cmd --permanent --zone=FedoraWorkstation --add-interface=ap0 >/dev/null
-    # tailscale0 must sit in the same zone as ap0. Without it the zone's forward
-    # chain has no rule for the tailnet interface and drops every packet from the
-    # AP into the tailnet. Measured 21 Nov 2026: phone -> peer failed.
-    firewall-cmd --permanent --zone=FedoraWorkstation --add-interface=tailscale0 >/dev/null
-    firewall-cmd --permanent --zone=FedoraWorkstation --add-masquerade >/dev/null
-    # Without dhcp and dns the AP looks healthy and cannot work: clients associate,
-    # authenticate, then get no address because udp 67/68 is dropped before dnsmasq.
-    firewall-cmd --permanent --zone=FedoraWorkstation --add-service=dhcp >/dev/null
-    firewall-cmd --permanent --zone=FedoraWorkstation --add-service=dns >/dev/null
-    firewall-cmd --reload >/dev/null
+    say "install: firewall ($(fw_backend))"
+    case "$(fw_backend)" in
+        firewalld)
+            local zone
+            zone=$(fw_zone)
+            # Reload first. --permanent reads the daemon's in-memory copy, not the file on
+            # disk, so after /etc was restored the daemon still held the old config: every
+            # add answered ALREADY_ENABLED and wrote nothing, and the reload at the end
+            # then dropped them all. Measured 21 Nov 2026.
+            firewall-cmd --reload >/dev/null 2>&1 || true
+            firewall-cmd --permanent --zone="$zone" --add-interface="$AP_IF" >/dev/null
+            # tailscale0 must sit in the same zone as the AP interface. Without it the
+            # zone's forward chain has no rule for the tailnet interface and drops every
+            # packet from the AP into the tailnet. Measured 21 Nov 2026: phone -> peer failed.
+            firewall-cmd --permanent --zone="$zone" --add-interface=tailscale0 >/dev/null
+            firewall-cmd --permanent --zone="$zone" --add-masquerade >/dev/null
+            # Without dhcp and dns the AP looks healthy and cannot work: clients associate,
+            # authenticate, then get no address because udp 67/68 is dropped before dnsmasq.
+            firewall-cmd --permanent --zone="$zone" --add-service=dhcp >/dev/null
+            firewall-cmd --permanent --zone="$zone" --add-service=dns >/dev/null
+            firewall-cmd --reload >/dev/null
 
-    # Prove it landed instead of trusting the warnings. A silent ALREADY_ENABLED leaves
-    # the zone empty after the reload, and the AP then associates but cannot route.
-    _fw=$(firewall-cmd --permanent --zone=FedoraWorkstation --list-all 2>/dev/null)
-    for _want in ap0 tailscale0; do
-        printf '%s\n' "$_fw" | grep -qE "^[[:space:]]*interfaces:.*\b$_want\b" \
-            || say "  WARNING: $_want is not in the FedoraWorkstation zone"
-    done
-    printf '%s\n' "$_fw" | grep -q 'masquerade: yes' \
-        || say "  WARNING: masquerade is off in the FedoraWorkstation zone"
+            # Prove it landed instead of trusting the warnings. A silent ALREADY_ENABLED
+            # leaves the zone empty after the reload, and the AP then associates without
+            # routing.
+            _fw=$(firewall-cmd --permanent --zone="$zone" --list-all 2>/dev/null)
+            for _want in "$AP_IF" tailscale0; do
+                printf '%s\n' "$_fw" | grep -qE "^[[:space:]]*interfaces:.*\b$_want\b" \
+                    || say "  WARNING: $_want is not in the $zone zone"
+            done
+            printf '%s\n' "$_fw" | grep -q 'masquerade: yes' \
+                || say "  WARNING: masquerade is off in the $zone zone"
+            ;;
+        iptables)
+            say "  iptables: the AP rules are added by 'on' and removed by 'off'"
+            ;;
+        none)
+            say "  no firewall tool found: forwarding and NAT are unmanaged"
+            ;;
+    esac
 
     systemctl daemon-reload
     nmcli general reload >/dev/null 2>&1 || true
@@ -655,7 +774,7 @@ CONF
     else
         say "  WARNING: tailscale is not installed"
         say "           clients would reach this host only, not the tailnet"
-        say "           install it first:  dnf install tailscale && tailscale up"
+        say "           install it first:  $(pkg_hint tailscale) && tailscale up"
     fi
 
     say "install: network key"
@@ -776,6 +895,29 @@ do_clients() {
 }
 
 
+# ---------------- doctor ----------------
+# do_doctor: what this machine has and what it is missing. The first thing to run on a
+# new Raspberry Pi, before install, so a missing package is obvious.
+do_doctor() {
+    local os ap
+    os=$(. /etc/os-release 2>/dev/null; printf '%s' "${PRETTY_NAME:-unknown}")
+    ap=$(nmcli -f WIFI-PROPERTIES.AP device show "$WIFI_IF" 2>/dev/null \
+         | awk -F: '{gsub(/ /,"",$2); print $2}' | head -1)
+    say "tailnet-ap doctor"
+    printf "  %-12s %s\n" "os" "$os"
+    printf "  %-12s %s (%s)\n" "uplink" "$UP_IF" "$( [ -e "/sys/class/net/$UP_IF" ] && echo present || echo MISSING )"
+    printf "  %-12s %s (%s)\n" "wifi" "$WIFI_IF" "$( [ -e "/sys/class/net/$WIFI_IF" ] && echo present || echo MISSING )"
+    printf "  %-12s %s\n" "wireless" "$( [ -e "/sys/class/net/$WIFI_IF/wireless" ] && echo yes || echo no )"
+    printf "  %-12s %s\n" "hostapd" "$(command -v hostapd || echo MISSING)"
+    printf "  %-12s %s\n" "dnsmasq" "$(command -v dnsmasq || echo MISSING)"
+    printf "  %-12s %s\n" "tailscale" "$(command -v tailscale || echo MISSING)"
+    printf "  %-12s %s\n" "iw" "$(command -v iw || echo MISSING)"
+    printf "  %-12s %s\n" "nmcli" "$(command -v nmcli || echo MISSING)"
+    printf "  %-12s %s\n" "firewall" "$(fw_backend)"
+    printf "  %-12s %s\n" "country" "$COUNTRY"
+    printf "  %-12s %s\n" "ap capable" "${ap:-unknown (needs nmcli)}"
+}
+
 # do_key [set PASSWORD]
 # With no argument, print the current password. With "set PASSWORD", replace it.
 # The key is the tailnet's front door, so this needs root like the rest.
@@ -830,6 +972,7 @@ do_key_set() {
 # ---------------- dispatch ----------------
 main() {
     SELF=$(readlink -f "$0")
+    detect_ifaces
     local cmd=${1:-help}
     [ "$#" -gt 0 ] && shift
     case "$cmd" in
@@ -839,6 +982,7 @@ main() {
         toggle)               do_toggle ;;
         status)               do_status ;;
         clients)              do_clients ;;
+        doctor)               do_doctor ;;
         key)                  do_key "$@" ;;
         help|-h|--help)       awk 'NR>1 { if (/^#/) { sub(/^# ?/, ""); print; next }
                                           if (/^$/) { print ""; next }
@@ -849,9 +993,9 @@ main() {
 
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
     SELF=$(readlink -f "$0")
-    # help and status only read. Everything else changes the machine and needs root.
+    # help, status and doctor only read. Everything else changes the machine and needs root.
     case "${1:-help}" in
-        help|-h|--help|status) main "$@"; exit 0 ;;
+        help|-h|--help|status|doctor) main "$@"; exit 0 ;;
         install|on|off|toggle|key|clients) ;;
         *) die "unknown command: ${1:-} (try: tailnet-ap help)" ;;
     esac

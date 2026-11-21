@@ -268,6 +268,7 @@ same "the passphrase is written as given, no escapes or expansion" \
 GOLDEN_6='# Rewritten by tailnet-ap-on.sh on every start: the channel follows the uplink.
 interface=ap0
 driver=nl80211
+country_code=NL
 ssid=thinkpad-tailnet
 hw_mode=g
 channel=6
@@ -282,6 +283,7 @@ ignore_broadcast_ssid=0'
 GOLDEN_149='# Rewritten by tailnet-ap-on.sh on every start: the channel follows the uplink.
 interface=ap0
 driver=nl80211
+country_code=NL
 ssid=thinkpad-tailnet
 hw_mode=a
 channel=149
