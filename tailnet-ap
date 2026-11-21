@@ -41,8 +41,10 @@ fi
 # writing NetworkManager profiles stay in the entry scripts, where they read top to bottom.
 
 # ---- names ----
-VERSION=1.1.0
-REPO_RAW=https://raw.githubusercontent.com/FastAsFack/tailnet-ap/main/tailnet-ap
+VERSION=1.1.1
+# The contents API, not raw.githubusercontent.com: the raw CDN served a stale copy
+# for minutes after a push and `update` downgraded the host once. The API is current.
+REPO_RAW=https://api.github.com/repos/FastAsFack/tailnet-ap/contents/tailnet-ap?ref=main
 SSID=thinkpad-tailnet
 HOSTIP=10.42.7.1
 PREFIX=24
@@ -964,9 +966,12 @@ do_update() {
     fi
     tmp=$(mktemp /tmp/tailnet-ap.XXXXXX) || die "could not make a temp file"
     if command -v curl >/dev/null 2>&1; then
-        curl -fsSL "$REPO_RAW" -o "$tmp" || { rm -f "$tmp"; die "could not download $REPO_RAW"; }
+        curl -fsSL -H "Accept: application/vnd.github.raw" -H "User-Agent: tailnet-ap" \
+            "$REPO_RAW" -o "$tmp" || { rm -f "$tmp"; die "could not download $REPO_RAW"; }
     else
-        wget -qO "$tmp" "$REPO_RAW" || { rm -f "$tmp"; die "could not download $REPO_RAW"; }
+        wget -qO "$tmp" --header="Accept: application/vnd.github.raw" \
+            --header="User-Agent: tailnet-ap" "$REPO_RAW" \
+            || { rm -f "$tmp"; die "could not download $REPO_RAW"; }
     fi
     if ! bash -n "$tmp" 2>/dev/null; then
         rm -f "$tmp"
@@ -975,11 +980,20 @@ do_update() {
     new_ver=$(awk -F= '/^VERSION=/ {gsub(/"/,"",$2); print $2; exit}' "$tmp")
     old_sum=$(sha256sum "$SELF" 2>/dev/null | awk '{print $1}')
     new_sum=$(sha256sum "$tmp" | awk '{print $1}')
+    local newer=no
+    if [ -n "$new_ver" ] \
+        && [ "$(printf '%s\n%s\n' "${VERSION:-}" "$new_ver" | sort -V | tail -1)" = "$new_ver" ]; then
+        newer=yes
+    fi
     if [ "$check" = yes ]; then
         say "installed : ${VERSION:-unknown}  ${old_sum:-unknown}"
         say "latest    : ${new_ver:-unknown}  $new_sum"
         if [ "$old_sum" = "$new_sum" ]; then
             say "up to date"
+        elif [ -z "$new_ver" ]; then
+            say "the remote file has no VERSION; not installing it"
+        elif [ "$newer" = no ]; then
+            say "installed is newer than the remote ($VERSION > $new_ver)"
         else
             say "an update is available: sudo tailnet-ap update"
         fi
@@ -990,6 +1004,14 @@ do_update() {
         say "already up to date ($VERSION)"
         rm -f "$tmp"
         return 0
+    fi
+    if [ -z "$new_ver" ]; then
+        rm -f "$tmp"
+        die "the downloaded file has no VERSION; refusing to install it"
+    fi
+    if [ "$newer" = no ]; then
+        rm -f "$tmp"
+        die "the downloaded version ($new_ver) is older than the installed one ($VERSION)"
     fi
     say "updating ${VERSION:-?} -> ${new_ver:-?}"
     cp -p "$SELF" "/usr/local/bin/tailnet-ap.bak" 2>/dev/null || true

@@ -7,6 +7,20 @@ changed, and how it was checked. The program prints its own version with
 Versions are `MAJOR.MINOR.PATCH`. `1.1.0` is the first release that runs outside
 Fedora.
 
+## 1.1.1 - 2026-11-21
+
+Fixes `update` itself.
+
+- **`update` downloads through the GitHub contents API**, not
+  `raw.githubusercontent.com`. The raw CDN served the previous commit for several
+  minutes after the 1.1.0 push: `update --check` saw the old file and `update`
+  installed it, **downgrading** a host. The API returns the current blob
+  immediately. Requests carry `Accept: application/vnd.github.raw` and a
+  `User-Agent`.
+- **`update` refuses a file with no `VERSION` or an older version.** A stale or
+  truncated download can no longer overwrite a newer installed program. `--check`
+  names the case instead of offering a downgrade.
+
 ## 1.1.0 - 2026-11-21
 
 Runs on Raspberry Pi OS, Debian and Ubuntu, not only Fedora. Proven on a
