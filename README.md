@@ -78,10 +78,26 @@ sudo tailnet-ap status             # what is running
 sudo tailnet-ap clients            # who is on the AP, with signal and traffic
 sudo tailnet-ap key                # print the Wi-Fi password
 sudo tailnet-ap key set 'newpass'  # change it (8 to 63 characters)
+sudo tailnet-ap update             # pull the latest from GitHub
+tailnet-ap version                 # what version is installed
 tailnet-ap help                    # the list
 ```
 
 `cable` and `wifi` are the readable names. `a` and `b` still work as aliases.
+
+## Update
+
+```bash
+sudo tailnet-ap update --check    # compare with GitHub, change nothing
+sudo tailnet-ap update            # install the latest, keep the key and configs
+```
+
+`update` downloads the program from GitHub, rejects anything that is not valid
+shell, keeps the old copy as `/usr/local/bin/tailnet-ap.bak`, and refreshes the
+drop-ins. It does not restart the AP; `tailnet-ap on` applies new rules.
+
+The full history, with what changed and why, is in
+[CHANGELOG.md](CHANGELOG.md).
 
 ## The key
 
@@ -98,6 +114,12 @@ The AP subnet `10.42.7.0/24` is advertised to the tailnet. The first time, the
 route needs approving in the Tailscale admin console. After that it stays
 approved. The AP's DNS forwards to the laptop's resolver, so MagicDNS names work
 on the clients.
+
+For the other direction, a tailnet device that must reach an AP client by its
+`10.42.7.x` address needs `tailscale set --accept-routes` on **that device**.
+`tailnet-ap doctor` shows whether the host it runs on has it on, and prints the
+exact fix when it does not. Clients reaching the tailnet do not need it: the AP
+masquerades them, so they appear as the AP host.
 
 ## Tests
 

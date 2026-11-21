@@ -8,6 +8,8 @@
 #   tailnet-ap status                  what is running
 #   tailnet-ap clients                 which devices are on the access point
 #   tailnet-ap doctor                  check this machine for what the AP needs
+#   tailnet-ap update [--check]        replace this program with the latest from GitHub
+#   tailnet-ap version                 print the version
 #   tailnet-ap key                     print the wi-fi password (needs root)
 #   tailnet-ap key set PASSWORD        replace it (8 to 63 characters)
 #   tailnet-ap help                    this text
@@ -39,6 +41,8 @@ fi
 # writing NetworkManager profiles stay in the entry scripts, where they read top to bottom.
 
 # ---- names ----
+VERSION=1.1.0
+REPO_RAW=https://raw.githubusercontent.com/FastAsFack/tailnet-ap/main/tailnet-ap
 SSID=thinkpad-tailnet
 HOSTIP=10.42.7.1
 PREFIX=24
@@ -947,6 +951,62 @@ CONF
     printf "  firewall          : %s\n" "$(fw_backend)"
 }
 
+# ---------------- version / update ----------------
+do_version() { say "tailnet-ap $VERSION"; }
+
+# do_update [--check]: replace this program with the latest one from the repository.
+# The key and the configs are left alone; install only refreshes the drop-ins.
+do_update() {
+    local check=no tmp old_sum new_sum new_ver
+    [ "${1:-}" = "--check" ] && check=yes
+    if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+        die "update needs curl or wget"
+    fi
+    tmp=$(mktemp /tmp/tailnet-ap.XXXXXX) || die "could not make a temp file"
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL "$REPO_RAW" -o "$tmp" || { rm -f "$tmp"; die "could not download $REPO_RAW"; }
+    else
+        wget -qO "$tmp" "$REPO_RAW" || { rm -f "$tmp"; die "could not download $REPO_RAW"; }
+    fi
+    if ! bash -n "$tmp" 2>/dev/null; then
+        rm -f "$tmp"
+        die "the downloaded file is not valid shell; nothing was changed"
+    fi
+    new_ver=$(awk -F= '/^VERSION=/ {gsub(/"/,"",$2); print $2; exit}' "$tmp")
+    old_sum=$(sha256sum "$SELF" 2>/dev/null | awk '{print $1}')
+    new_sum=$(sha256sum "$tmp" | awk '{print $1}')
+    if [ "$check" = yes ]; then
+        say "installed : ${VERSION:-unknown}  ${old_sum:-unknown}"
+        say "latest    : ${new_ver:-unknown}  $new_sum"
+        if [ "$old_sum" = "$new_sum" ]; then
+            say "up to date"
+        else
+            say "an update is available: sudo tailnet-ap update"
+        fi
+        rm -f "$tmp"
+        return 0
+    fi
+    if [ "$old_sum" = "$new_sum" ]; then
+        say "already up to date ($VERSION)"
+        rm -f "$tmp"
+        return 0
+    fi
+    say "updating ${VERSION:-?} -> ${new_ver:-?}"
+    cp -p "$SELF" "/usr/local/bin/tailnet-ap.bak" 2>/dev/null || true
+    install -m 755 "$tmp" /usr/local/bin/tailnet-ap \
+        || { rm -f "$tmp"; die "could not write /usr/local/bin/tailnet-ap"; }
+    rm -f "$tmp"
+    # Refresh the drop-ins, unit and launcher with the new program. The self-copy guard
+    # sees it is already in place and skips the copy, but everything else is rewritten.
+    /usr/local/bin/tailnet-ap install >/dev/null 2>&1 \
+        || say "warning: the new program installed but 'install' failed; run it by hand"
+    say "updated to $(/usr/local/bin/tailnet-ap version 2>/dev/null || echo "${new_ver:-?}")"
+    say "the old copy is at /usr/local/bin/tailnet-ap.bak"
+    if ap_is_up 2>/dev/null; then
+        say "the AP is still running the old rules; apply them with:  tailnet-ap on"
+    fi
+}
+
 # ---------------- status ----------------
 # svc_state UNIT: active/inactive/failed, or "unknown" when systemd cannot answer.
 # systemctl is-active prints its answer and then exits non-zero, so a plain "|| echo"
@@ -1036,6 +1096,18 @@ do_doctor() {
     printf "  %-12s %s\n" "firewall" "$(fw_backend)"
     printf "  %-12s %s\n" "country" "$COUNTRY"
     printf "  %-12s %s\n" "ap capable" "${ap:-unknown (needs nmcli)}"
+    local routeall adv
+    routeall=$(tailscale debug prefs 2>/dev/null | grep -o '"RouteAll": [a-z]*' | awk '{print $2}')
+    adv=$(tailscale debug prefs 2>/dev/null | grep -o '"AdvertiseRoutes": \[[^]]*\]' | sed 's/.*\[//; s/\].*//')
+    printf "  %-12s %s\n" "accept-routes" "${routeall:-unknown}"
+    printf "  %-12s %s\n" "subnet route" "${adv:-none}"
+    if [ "${routeall:-}" = false ]; then
+        printf "  %-12s %s\n" "" "this device cannot reach AP clients by 10.42.7.x"
+        printf "  %-12s %s\n" "" "fix: tailscale set --accept-routes"
+    fi
+    if [ -n "$adv" ] && [ "$adv" != "[]" ]; then
+        printf "  %-12s %s\n" "" "approve the subnet route in the Tailscale admin console"
+    fi
 }
 
 # do_key [set PASSWORD]
@@ -1105,6 +1177,8 @@ main() {
         status)               do_status ;;
         clients)              do_clients ;;
         doctor)               do_doctor ;;
+        version|--version|-V) do_version ;;
+        update)               do_update "$@" ;;
         key)                  do_key "$@" ;;
         help|-h|--help)       awk 'NR>1 { if (/^#/) { sub(/^# ?/, ""); print; next }
                                           if (/^$/) { print ""; next }
@@ -1117,8 +1191,11 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
     SELF=$(readlink -f "$0")
     # help, status and doctor only read. Everything else changes the machine and needs root.
     case "${1:-help}" in
-        help|-h|--help|status|doctor) main "$@"; exit 0 ;;
-        install|on|off|toggle|key|clients) ;;
+        help|-h|--help|status|doctor|version|--version|-V) main "$@"; exit 0 ;;
+        update)
+            # --check only downloads and compares; it changes nothing.
+            if [ "${2:-}" = "--check" ]; then main "$@"; exit 0; fi ;;
+        install|on|off|toggle|key|clients|update) ;;
         *) die "unknown command: ${1:-} (try: tailnet-ap help)" ;;
     esac
 # ---- root, via pkexec when launched from the desktop ----
