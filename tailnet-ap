@@ -801,6 +801,9 @@ dhcp-option=option:dns-server,10.42.7.1
 no-resolv
 server=$DNS_UPSTREAM
 bogus-priv
+# The AP is IPv4-only. Without this, clients get AAAA records, try IPv6 first, and
+# Android reports "no internet". Measured 21 Nov 2026 on the Pi.
+filter-AAAA
 # domain-needed is deliberately NOT set: it makes dnsmasq refuse any name without a
 # dot, so "raspberry-server" never reaches the resolver. Measured 21 Nov 2026.
 dhcp-option=option:domain-search,$DOMAIN
@@ -977,7 +980,8 @@ do_clients() {
         say "the access point is not running"
         return 0
     fi
-    local leases=/var/lib/dnsmasq/dnsmasq.leases count
+    local leases=/var/lib/misc/dnsmasq.leases count
+    [ -f "$leases" ] || leases=/var/lib/dnsmasq/dnsmasq.leases
     count=$(iw dev "$AP_IF" station dump 2>/dev/null | grep -c '^Station' || true)
     say "clients on $SSID ($AP_IF)"
     if [ "${count:-0}" -eq 0 ]; then
