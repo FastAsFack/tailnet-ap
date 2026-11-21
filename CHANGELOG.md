@@ -171,10 +171,14 @@ while the Pi kept serving nginx, SSH and its tailnet address.
 
 ### Tests
 
-`bash tests/run-tests.sh` still runs 116 checks, no root, no radio. The suite
-runs from a fresh clone of the pushed repo. The Pi itself was the integration
-test: hostapd, dnsmasq, DHCP, DNS, NAT to the uplink, NAT to `tailscale0`, and
-`off` / `on` twice.
+`bash tests/run-tests.sh` runs 116 checks on `lib/tailnet-ap-lib.sh` and the
+functions extracted from `tailnet-ap-on.sh`, which is the code the single file
+was merged from. It does **not** source the merged file, so `update` and
+`doctor` are not covered by the suite. Those were exercised by hand on the Pi:
+`version`, `update --check`, a deliberately modified installed copy updated back
+to the released file, and `doctor` showing `accept-routes` and the AP subnet.
+The Pi was also the integration test: hostapd, dnsmasq, DHCP, DNS, NAT to the
+uplink, NAT to `tailscale0`, and `off` / `on` twice.
 
 ## 0.1.0 - 2026-11-21
 
