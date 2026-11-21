@@ -41,10 +41,12 @@ fi
 # writing NetworkManager profiles stay in the entry scripts, where they read top to bottom.
 
 # ---- names ----
-VERSION=1.1.1
+VERSION=1.1.2
 # The contents API, not raw.githubusercontent.com: the raw CDN served a stale copy
-# for minutes after a push and `update` downgraded the host once. The API is current.
-REPO_RAW=https://api.github.com/repos/FastAsFack/tailnet-ap/contents/tailnet-ap?ref=main
+# for minutes after a push. Even the contents API at ?ref=main is cached, so update
+# first reads the head SHA and pins the file URL to that commit.
+REPO_API=https://api.github.com/repos/FastAsFack/tailnet-ap
+REPO_RAW=$REPO_API/contents/tailnet-ap?ref=main
 SSID=thinkpad-tailnet
 HOSTIP=10.42.7.1
 PREFIX=24
@@ -965,13 +967,26 @@ do_update() {
         die "update needs curl or wget"
     fi
     tmp=$(mktemp /tmp/tailnet-ap.XXXXXX) || die "could not make a temp file"
+    local sha url
+    if command -v curl >/dev/null 2>&1; then
+        sha=$(curl -fsSL -H "User-Agent: tailnet-ap" "$REPO_API/commits/main" 2>/dev/null \
+              | python3 -c "import json,sys; print(json.load(sys.stdin).get('sha',''))" 2>/dev/null)
+    else
+        sha=$(wget -qO- --header="User-Agent: tailnet-ap" "$REPO_API/commits/main" 2>/dev/null \
+              | python3 -c "import json,sys; print(json.load(sys.stdin).get('sha',''))" 2>/dev/null)
+    fi
+    if [ -n "$sha" ]; then
+        url="$REPO_API/contents/tailnet-ap?ref=$sha"
+    else
+        url="$REPO_RAW"
+    fi
     if command -v curl >/dev/null 2>&1; then
         curl -fsSL -H "Accept: application/vnd.github.raw" -H "User-Agent: tailnet-ap" \
-            "$REPO_RAW" -o "$tmp" || { rm -f "$tmp"; die "could not download $REPO_RAW"; }
+            "$url" -o "$tmp" || { rm -f "$tmp"; die "could not download $url"; }
     else
         wget -qO "$tmp" --header="Accept: application/vnd.github.raw" \
-            --header="User-Agent: tailnet-ap" "$REPO_RAW" \
-            || { rm -f "$tmp"; die "could not download $REPO_RAW"; }
+            --header="User-Agent: tailnet-ap" "$url" \
+            || { rm -f "$tmp"; die "could not download $url"; }
     fi
     if ! bash -n "$tmp" 2>/dev/null; then
         rm -f "$tmp"
@@ -1118,16 +1133,20 @@ do_doctor() {
     printf "  %-12s %s\n" "firewall" "$(fw_backend)"
     printf "  %-12s %s\n" "country" "$COUNTRY"
     printf "  %-12s %s\n" "ap capable" "${ap:-unknown (needs nmcli)}"
-    local routeall adv
+    local routeall adv ap_adv
     routeall=$(tailscale debug prefs 2>/dev/null | grep -o '"RouteAll": [a-z]*' | awk '{print $2}')
-    adv=$(tailscale debug prefs 2>/dev/null | grep -o '"AdvertiseRoutes": \[[^]]*\]' | sed 's/.*\[//; s/\].*//')
+    adv=$(tailscale debug prefs 2>/dev/null | python3 -c "import json,sys; d=json.load(sys.stdin); print(','.join(d.get('AdvertiseRoutes') or []))" 2>/dev/null)
+    [ -n "$adv" ] || adv=$(tailscale debug prefs 2>/dev/null | grep -o '"AdvertiseRoutes": \[[^]]*\]' | sed 's/.*\[//; s/\].*//')
     printf "  %-12s %s\n" "accept-routes" "${routeall:-unknown}"
-    printf "  %-12s %s\n" "subnet route" "${adv:-none}"
+    case ",$adv," in
+        *",$HOSTIP/$PREFIX,"*) printf "  %-12s %s\n" "subnet route" "$HOSTIP/$PREFIX"; ap_adv=yes ;;
+        *) printf "  %-12s %s\n" "subnet route" "none"; ap_adv=no ;;
+    esac
     if [ "${routeall:-}" = false ]; then
-        printf "  %-12s %s\n" "" "this device cannot reach AP clients by 10.42.7.x"
+        printf "  %-12s %s\n" "" "this device cannot reach AP clients by ${HOSTIP%.*}.x"
         printf "  %-12s %s\n" "" "fix: tailscale set --accept-routes"
     fi
-    if [ -n "$adv" ] && [ "$adv" != "[]" ]; then
+    if [ "$ap_adv" = yes ]; then
         printf "  %-12s %s\n" "" "approve the subnet route in the Tailscale admin console"
     fi
 }

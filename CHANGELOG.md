@@ -7,6 +7,17 @@ changed, and how it was checked. The program prints its own version with
 Versions are `MAJOR.MINOR.PATCH`. `1.1.0` is the first release that runs outside
 Fedora.
 
+## 1.1.2 - 2026-11-21
+
+- **`update` pins the download to the current commit.** The contents API at
+  `?ref=main` is cached for up to a minute: `update --check` saw 1.1.0 while
+  `main` was 1.1.1. It now reads the head SHA from `/commits/main` and fetches
+  `contents/tailnet-ap?ref=<sha>`, a URL that is unique per commit.
+- **`doctor` reads `AdvertiseRoutes` as JSON.** The old single-line grep
+  reported `subnet route none` on the Pi, which was advertising `0.0.0.0/0`,
+  `::/0` and `10.42.7.0/24` across several lines. It now prints the AP subnet
+  when it is in the list.
+
 ## 1.1.1 - 2026-11-21
 
 Fixes `update` itself.
