@@ -89,12 +89,17 @@ tailnet-ap help                    # the list
 
 ```bash
 sudo tailnet-ap update --check    # compare with GitHub, change nothing
+sudo tailnet-ap update --test     # prove the update machinery, touch nothing
 sudo tailnet-ap update            # install the latest, keep the key and configs
 ```
 
-`update` downloads the program from GitHub, rejects anything that is not valid
-shell, keeps the old copy as `/usr/local/bin/tailnet-ap.bak`, and refreshes the
-drop-ins. It does not restart the AP; `tailnet-ap on` applies new rules.
+`--test` builds a copy of the installed program with `VERSION=9.9.9`, then
+checks the syntax, the version comparison, a temporary install, the installed
+copy's `version` output and the no-downgrade rule. It writes only to `/tmp` and
+does not contact GitHub. `update` itself downloads the program from GitHub,
+rejects anything that is not valid shell, keeps the old copy as
+`/usr/local/bin/tailnet-ap.bak`, and refreshes the drop-ins. It does not restart
+the AP; `tailnet-ap on` applies new rules.
 
 The full history, with what changed and why, is in
 [CHANGELOG.md](CHANGELOG.md).

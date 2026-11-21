@@ -7,6 +7,15 @@ changed, and how it was checked. The program prints its own version with
 Versions are `MAJOR.MINOR.PATCH`. `1.1.0` is the first release that runs outside
 Fedora.
 
+## 1.1.4 - 2026-11-21
+
+- **`tailnet-ap update --test`.** Builds a copy of the installed program with
+  `VERSION` bumped to `9.9.9`, then checks `bash -n`, the version parse, the
+  `sort -V` comparison, a temporary install, the installed copy's `version`
+  output, byte-identity and the no-downgrade rule. It writes only to `/tmp`,
+  does not contact GitHub, and cannot touch the installed program. This makes
+  the update path testable without cutting a release first.
+
 ## 1.1.3 - 2026-11-21
 
 - **`doctor` compares the advertised route to the network address, not the host

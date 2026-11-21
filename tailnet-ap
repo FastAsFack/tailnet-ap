@@ -8,7 +8,7 @@
 #   tailnet-ap status                  what is running
 #   tailnet-ap clients                 which devices are on the access point
 #   tailnet-ap doctor                  check this machine for what the AP needs
-#   tailnet-ap update [--check]        replace this program with the latest from GitHub
+#   tailnet-ap update [--check|--test]  replace this program with the latest from GitHub
 #   tailnet-ap version                 print the version
 #   tailnet-ap key                     print the wi-fi password (needs root)
 #   tailnet-ap key set PASSWORD        replace it (8 to 63 characters)
@@ -41,7 +41,7 @@ fi
 # writing NetworkManager profiles stay in the entry scripts, where they read top to bottom.
 
 # ---- names ----
-VERSION=1.1.3
+VERSION=1.1.4
 # The contents API, not raw.githubusercontent.com: the raw CDN served a stale copy
 # for minutes after a push. Even the contents API at ?ref=main is cached, so update
 # first reads the head SHA and pins the file URL to that commit.
@@ -958,10 +958,67 @@ CONF
 # ---------------- version / update ----------------
 do_version() { say "tailnet-ap $VERSION"; }
 
+# do_update_test: prove the update machinery without GitHub and without touching the
+# installed program. Copy the current file, bump its VERSION, then run the same steps
+# update uses against /tmp: syntax, version parse, comparison, install, version output.
+do_update_test() {
+    local src="$SELF" tmp tgt v fails=0
+    tmp=$(mktemp /tmp/tailnet-ap.candidate.XXXXXX) || die "could not make a temp file"
+    tgt=$(mktemp /tmp/tailnet-ap.installed.XXXXXX) \
+        || { rm -f "$tmp"; die "could not make a temp file"; }
+    say "update self-test (nothing outside /tmp is touched)"
+    sed 's/^VERSION=.*/VERSION=9.9.9/' "$src" > "$tmp"
+    if bash -n "$tmp" 2>/dev/null; then
+        say "  ok    the candidate is valid shell"
+    else
+        say "  FAIL  the candidate is valid shell"; fails=$((fails+1))
+    fi
+    v=$(awk -F= '/^VERSION=/ {gsub(/"/,"",$2); print $2; exit}' "$tmp")
+    if [ "$v" = "9.9.9" ]; then
+        say "  ok    the candidate reports 9.9.9"
+    else
+        say "  FAIL  the candidate reports 9.9.9 (got ${v:-nothing})"; fails=$((fails+1))
+    fi
+    if [ "$(printf '%s\n%s\n' "$VERSION" "$v" | sort -V | tail -1)" = "$v" ]; then
+        say "  ok    the candidate is newer than $VERSION"
+    else
+        say "  FAIL  the candidate is newer than $VERSION"; fails=$((fails+1))
+    fi
+    install -m 755 "$tmp" "$tgt" 2>/dev/null
+    if [ -x "$tgt" ]; then
+        say "  ok    the candidate installs"
+    else
+        say "  FAIL  the candidate installs"; fails=$((fails+1))
+    fi
+    if [ "$("$tgt" version 2>/dev/null)" = "tailnet-ap 9.9.9" ]; then
+        say "  ok    the installed candidate reports 9.9.9"
+    else
+        say "  FAIL  the installed candidate reports 9.9.9"; fails=$((fails+1))
+    fi
+    if [ "$(sha256sum "$tmp" | cut -d' ' -f1)" = "$(sha256sum "$tgt" | cut -d' ' -f1)" ]; then
+        say "  ok    the installed copy is byte-identical"
+    else
+        say "  FAIL  the installed copy is byte-identical"; fails=$((fails+1))
+    fi
+    if [ "$(printf '%s\n%s\n' "9.9.9" "1.0.0" | sort -V | tail -1)" != "1.0.0" ]; then
+        say "  ok    an older version is refused"
+    else
+        say "  FAIL  an older version is refused"; fails=$((fails+1))
+    fi
+    rm -f "$tmp" "$tgt"
+    if [ "$fails" -eq 0 ]; then
+        say "all update checks passed"
+    else
+        say "$fails update check(s) failed"
+        return 1
+    fi
+}
+
 # do_update [--check]: replace this program with the latest one from the repository.
 # The key and the configs are left alone; install only refreshes the drop-ins.
 do_update() {
     local check=no tmp old_sum new_sum new_ver
+    [ "${1:-}" = "--test" ] && { do_update_test; return $?; }
     [ "${1:-}" = "--check" ] && check=yes
     if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
         die "update needs curl or wget"
@@ -1235,8 +1292,10 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
     case "${1:-help}" in
         help|-h|--help|status|doctor|version|--version|-V) main "$@"; exit 0 ;;
         update)
-            # --check only downloads and compares; it changes nothing.
-            if [ "${2:-}" = "--check" ]; then main "$@"; exit 0; fi ;;
+            # --check and --test only read and write /tmp; they change nothing.
+            case "${2:-}" in
+                --check|--test) main "$@"; exit 0 ;;
+            esac ;;
         install|on|off|toggle|key|clients|update) ;;
         *) die "unknown command: ${1:-} (try: tailnet-ap help)" ;;
     esac
