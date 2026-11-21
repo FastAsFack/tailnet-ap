@@ -51,16 +51,20 @@ AP_IF=ap0
 # Regulatory country for hostapd. A Pi often has no country set and then hostapd refuses
 # the radio. Override with TAILNET_AP_COUNTRY.
 COUNTRY=${TAILNET_AP_COUNTRY:-NL}
+# Tailnet domain and an optional static host shortcut. The defaults are this homelab's;
+# a friend overrides both. TAILNET_AP_HOSTRECORD= (empty) turns the shortcut off.
+DOMAIN=${TAILNET_AP_DOMAIN:-taile8e387.ts.net}
+HOSTRECORD=${TAILNET_AP_HOSTRECORD:-raspberry-server,100.116.252.86}
 PSKFILE=/etc/hostapd/tailnet-ap.psk
 NM_CON=tailnet-ap
 UPLINK_CON=tailnet-ap-uplink
 HOSTAPD_UNIT=tailnet-ap-hostapd
 NMDIR=/etc/NetworkManager/system-connections
 HOSTAPD_CONF=/etc/hostapd/tailnet-ap.conf
-# The person who uses the desktop. NOT SUDO_USER: this machine's admin account is hermes,
-# while the desktop belongs to tijnb, so SUDO_USER puts the launcher and the key copy in
-# the wrong home. Override with TAILNET_AP_USER=name.
-DESKTOP_USER=${TAILNET_AP_USER:-tijnb}
+# The user who owns the desktop. On the ThinkPad that is tijnb, not the admin hermes;
+# on a fresh Pi or Ubuntu box it is whatever user was created first. Detected in
+# detect_desktop_user, overridable with TAILNET_AP_USER.
+DESKTOP_USER=${TAILNET_AP_USER:-}
 
 die() { echo "tailnet-ap: $*" >&2; exit 1; }
 say() { printf '%s\n' "$*"; }
@@ -94,6 +98,29 @@ detect_ifaces() {
             if [ -e "$w/wireless" ]; then WIFI_IF=$(basename "$w"); break; fi
         done
     fi
+}
+
+# detect_desktop_user: the account that owns the desktop. The owner of the active
+# graphical session wins, because on the ThinkPad the SSH caller is hermes while the
+# desktop is tijnb's. Fallbacks: the sudo caller, the first regular user, the current
+# user. Override with TAILNET_AP_USER.
+detect_desktop_user() {
+    [ -n "$DESKTOP_USER" ] && return 0
+    local u
+    u=$(loginctl list-sessions --no-legend 2>/dev/null \
+        | awk '{for (i=1;i<=NF;i++) if ($i=="seat0") {print $3; exit}}')
+    if [ -n "$u" ] && getent passwd "$u" >/dev/null 2>&1; then
+        DESKTOP_USER=$u
+        return 0
+    fi
+    if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != root ] \
+        && getent passwd "$SUDO_USER" >/dev/null 2>&1; then
+        DESKTOP_USER=$SUDO_USER
+        return 0
+    fi
+    u=$(getent passwd 1000 2>/dev/null | cut -d: -f1)
+    [ -n "$u" ] && { DESKTOP_USER=$u; return 0; }
+    DESKTOP_USER=$(id -un)
 }
 
 # ---- argument parsing ----
@@ -261,11 +288,12 @@ cable_ready() {
 }
 
 # ---- firewall ----
-# fw_backend: who manages the firewall here. firewalld on Fedora, iptables on a plain
-# Raspberry Pi OS install, none when neither is present.
+# fw_backend: who manages the firewall here. firewalld on Fedora, iptables on most
+# Debian-family installs (also behind ufw), nft on systems that ship only nft.
 fw_backend() {
     if command -v firewall-cmd >/dev/null 2>&1; then echo firewalld
     elif command -v iptables >/dev/null 2>&1; then echo iptables
+    elif command -v nft >/dev/null 2>&1; then echo nftables
     else echo none
     fi
 }
@@ -282,41 +310,73 @@ fw_zone() {
 }
 
 # fw_apply: open the AP path when firewalld is not the manager. Idempotent: -C checks
-# first, so running it twice does not stack rules.
+# first, and -I puts the rule in front of ufw's or the distro's own FORWARD rules.
 fw_apply() {
-    [ "$(fw_backend)" = iptables ] || return 0
     local rule
-    for rule in \
-        "-t nat -C POSTROUTING -s $HOSTIP/$PREFIX -o $UP_IF -j MASQUERADE" \
-        "-C FORWARD -i $AP_IF -o $UP_IF -j ACCEPT" \
-        "-C FORWARD -i $UP_IF -o $AP_IF -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT" \
-        "-C FORWARD -i $AP_IF -o tailscale0 -j ACCEPT" \
-        "-C FORWARD -i tailscale0 -o $AP_IF -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT" \
-        "-C INPUT -i $AP_IF -p udp --dport 67 -j ACCEPT" \
-        "-C INPUT -i $AP_IF -p udp --dport 53 -j ACCEPT" \
-        "-C INPUT -i $AP_IF -p tcp --dport 53 -j ACCEPT"
-    do
-        iptables $rule >/dev/null 2>&1 && continue
-        iptables $(printf '%s' "$rule" | sed 's/ -C / -A /') >/dev/null 2>&1 || true
-    done
+    case "$(fw_backend)" in
+        iptables)
+            for rule in \
+                "-t nat -C POSTROUTING -s $HOSTIP/$PREFIX -o $UP_IF -j MASQUERADE" \
+                "-C FORWARD -i $AP_IF -o $UP_IF -j ACCEPT" \
+                "-C FORWARD -i $UP_IF -o $AP_IF -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT" \
+                "-C FORWARD -i $AP_IF -o tailscale0 -j ACCEPT" \
+                "-C FORWARD -i tailscale0 -o $AP_IF -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT" \
+                "-C INPUT -i $AP_IF -p udp --dport 67 -j ACCEPT" \
+                "-C INPUT -i $AP_IF -p udp --dport 53 -j ACCEPT" \
+                "-C INPUT -i $AP_IF -p tcp --dport 53 -j ACCEPT"
+            do
+                iptables $rule >/dev/null 2>&1 && continue
+                iptables $(printf '%s' "$rule" | sed 's/ -C / -I /') >/dev/null 2>&1 || true
+            done
+            ;;
+        nftables)
+            nft list table inet tailnet_ap >/dev/null 2>&1 && nft delete table inet tailnet_ap
+            nft -f - <<NFT
+table inet tailnet_ap {
+    chain forward {
+        type filter hook forward priority filter; policy accept;
+        iifname "$AP_IF" accept
+        oifname "$AP_IF" accept
+    }
+    chain postrouting {
+        type nat hook postrouting priority srcnat; policy accept;
+        ip saddr $HOSTIP/$PREFIX oifname "$UP_IF" masquerade
+        ip saddr $HOSTIP/$PREFIX oifname "tailscale0" masquerade
+    }
+    chain input {
+        type filter hook input priority filter; policy accept;
+        iifname "$AP_IF" udp dport 67 accept
+        iifname "$AP_IF" udp dport 53 accept
+        iifname "$AP_IF" tcp dport 53 accept
+    }
+}
+NFT
+            ;;
+    esac
 }
 
 # fw_remove: drop the same rules, so off leaves no open door behind.
 fw_remove() {
-    [ "$(fw_backend)" = iptables ] || return 0
     local rule
-    for rule in \
-        "-t nat -D POSTROUTING -s $HOSTIP/$PREFIX -o $UP_IF -j MASQUERADE" \
-        "-D FORWARD -i $AP_IF -o $UP_IF -j ACCEPT" \
-        "-D FORWARD -i $UP_IF -o $AP_IF -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT" \
-        "-D FORWARD -i $AP_IF -o tailscale0 -j ACCEPT" \
-        "-D FORWARD -i tailscale0 -o $AP_IF -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT" \
-        "-D INPUT -i $AP_IF -p udp --dport 67 -j ACCEPT" \
-        "-D INPUT -i $AP_IF -p udp --dport 53 -j ACCEPT" \
-        "-D INPUT -i $AP_IF -p tcp --dport 53 -j ACCEPT"
-    do
-        iptables $rule >/dev/null 2>&1 || true
-    done
+    case "$(fw_backend)" in
+        iptables)
+            for rule in \
+                "-t nat -D POSTROUTING -s $HOSTIP/$PREFIX -o $UP_IF -j MASQUERADE" \
+                "-D FORWARD -i $AP_IF -o $UP_IF -j ACCEPT" \
+                "-D FORWARD -i $UP_IF -o $AP_IF -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT" \
+                "-D FORWARD -i $AP_IF -o tailscale0 -j ACCEPT" \
+                "-D FORWARD -i tailscale0 -o $AP_IF -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT" \
+                "-D INPUT -i $AP_IF -p udp --dport 67 -j ACCEPT" \
+                "-D INPUT -i $AP_IF -p udp --dport 53 -j ACCEPT" \
+                "-D INPUT -i $AP_IF -p tcp --dport 53 -j ACCEPT"
+            do
+                iptables $rule >/dev/null 2>&1 || true
+            done
+            ;;
+        nftables)
+            nft delete table inet tailnet_ap >/dev/null 2>&1 || true
+            ;;
+    esac
 }
 
 stop_ap() {
@@ -658,7 +718,13 @@ do_toggle() {
 # the same four drop-ins, the same firewall changes, the same key handling.
 do_install() {
     [ "$(id -u)" -eq 0 ] || die "install needs root: sudo tailnet-ap install"
+    detect_desktop_user
     local hostuser=${DESKTOP_USER}
+    local t
+    for t in hostapd dnsmasq iw; do
+        command -v "$t" >/dev/null 2>&1 \
+            || die "$t is missing. Install it: $(pkg_hint "$t")"
+    done
     local userhome desktop
     userhome=$(getent passwd "$hostuser" | cut -d: -f6)
     [ -n "$userhome" ] || die "no home directory for $hostuser"
@@ -666,6 +732,11 @@ do_install() {
 
     say "install: static pieces"
     install -d -m 755 /etc/dnsmasq.d /etc/hostapd
+
+    # A distro hostapd unit that is already running will fight ours for the radio.
+    if systemctl is-active --quiet hostapd 2>/dev/null; then
+        say "  WARNING: the system's hostapd.service is running; stop it to avoid a conflict"
+    fi
 
     if command -v nmcli >/dev/null 2>&1; then
         install -d -m 755 /etc/NetworkManager/conf.d
@@ -678,7 +749,7 @@ CONF
         say "  no NetworkManager: skipping the ap0 unmanaged rule"
     fi
 
-    cat > /etc/dnsmasq.d/tailnet-ap.conf <<'CONF'
+    cat > /etc/dnsmasq.d/tailnet-ap.conf <<CONF
 # DHCP and DNS for clients on the virtual AP interface ap0.
 interface=ap0
 bind-dynamic
@@ -690,20 +761,22 @@ server=127.0.0.53
 bogus-priv
 # domain-needed is deliberately NOT set: it makes dnsmasq refuse any name without a
 # dot, so "raspberry-server" never reaches the resolver. Measured 21 Nov 2026.
-dhcp-option=option:domain-search,taile8e387.ts.net
-domain=taile8e387.ts.net
-# Static shortcut so the bare name works for clients that ignore the search domain.
-host-record=raspberry-server,100.116.252.86
+dhcp-option=option:domain-search,$DOMAIN
+domain=$DOMAIN
 CONF
+    # Optional static shortcut for clients that ignore the search domain.
+    [ -n "$HOSTRECORD" ] && echo "host-record=$HOSTRECORD" >> /etc/dnsmasq.d/tailnet-ap.conf
 
-    cat > /etc/systemd/system/tailnet-ap-hostapd.service <<'CONF'
+    local hostapd_bin
+    hostapd_bin=$(command -v hostapd || echo /usr/sbin/hostapd)
+    cat > /etc/systemd/system/tailnet-ap-hostapd.service <<CONF
 [Unit]
-Description=hostapd for the tailnet AP (thinkpad-tailnet)
+Description=hostapd for the tailnet AP ($SSID)
 After=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/sbin/hostapd /etc/hostapd/tailnet-ap.conf
+ExecStart=$hostapd_bin $HOSTAPD_CONF
 Restart=no
 
 [Install]
@@ -973,6 +1046,7 @@ do_key_set() {
 main() {
     SELF=$(readlink -f "$0")
     detect_ifaces
+    detect_desktop_user
     local cmd=${1:-help}
     [ "$#" -gt 0 ] && shift
     case "$cmd" in

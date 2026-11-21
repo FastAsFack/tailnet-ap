@@ -1,6 +1,6 @@
 # tailnet-ap
 
-One program that turns a Fedora laptop into a Wi-Fi access point whose clients
+One program that turns a Linux box into a Wi-Fi access point whose clients
 reach the whole tailnet, with no software installed on the clients.
 
 A phone or tablet joins the access point like any normal Wi-Fi network. Every
@@ -17,8 +17,9 @@ Normal internet keeps leaving through the laptop's own uplink.
 
 ## Requirements
 
-- Linux with `hostapd`, `dnsmasq`, `iw` and either `firewalld` (Fedora) or `iptables`
-  (Raspberry Pi OS / Debian).
+- Linux with `hostapd`, `dnsmasq`, `iw` and a firewall: `firewalld` (Fedora),
+  `iptables` (Debian, Ubuntu, Raspberry Pi OS, also behind `ufw`), or `nft` as a
+  fallback.
 - NetworkManager is used when present. Without it, cable mode still works; Wi-Fi mode
   needs `nmcli` to manage the uplink.
 - Tailscale installed and running. The program does **not** install Tailscale.
@@ -26,7 +27,14 @@ Normal internet keeps leaving through the laptop's own uplink.
 - Root for `install`, `on`, `off`, `toggle`, `clients` and `key`.
 
 Run `tailnet-ap doctor` on a new machine. It lists the interfaces it found and every
-tool that is present or missing.
+tool that is present or missing. `install` also picks the desktop user itself: the
+sudo caller, the first regular user, or you. Override with `TAILNET_AP_USER`.
+
+## Ubuntu / Debian
+
+Same as the Pi: `sudo apt install hostapd dnsmasq iptables iw`, then `doctor`, `install`,
+`on --mode cable`. With `ufw` active the rules are inserted ahead of ufw's own, so no
+extra ufw commands are needed.
 
 ## Raspberry Pi
 
