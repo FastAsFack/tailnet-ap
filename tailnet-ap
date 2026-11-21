@@ -401,16 +401,30 @@ stop_ap() {
     systemctl stop "$HOSTAPD_UNIT" >/dev/null 2>&1
     systemctl stop dnsmasq >/dev/null 2>&1
     if [ -d "/sys/class/net/$AP_IF" ]; then
+        ip link set "$AP_IF" down >/dev/null 2>&1
         ip addr flush dev "$AP_IF" >/dev/null 2>&1
         iw dev "$AP_IF" del >/dev/null 2>&1
     fi
 }
 
 start_ap_on() {
-    local ch=$1
+    local ch=$1 mode=${2:-wifi}
     if [ ! -d "/sys/class/net/$AP_IF" ]; then
-        iw dev "$WIFI_IF" interface add "$AP_IF" type __ap >/dev/null 2>&1 \
-            || die "could not create the virtual AP interface $AP_IF"
+        if ! iw dev "$WIFI_IF" interface add "$AP_IF" type __ap >/dev/null 2>&1; then
+            # brcmfmac (Pi) can be left in AP mode after hostapd stops and then refuse a
+            # new AP interface. Cycling the link clears it. Only safe when the radio is
+            # not the uplink, so cable mode only.
+            if [ "$mode" = cable ]; then
+                ip link set "$WIFI_IF" down >/dev/null 2>&1
+                sleep 1
+                ip link set "$WIFI_IF" up >/dev/null 2>&1
+                sleep 1
+                iw dev "$WIFI_IF" interface add "$AP_IF" type __ap >/dev/null 2>&1 \
+                    || die "could not create the virtual AP interface $AP_IF"
+            else
+                die "could not create the virtual AP interface $AP_IF"
+            fi
+        fi
     fi
     ip link set "$AP_IF" up >/dev/null 2>&1
     ip addr replace "$HOSTIP/$PREFIX" dev "$AP_IF" >/dev/null 2>&1
@@ -586,7 +600,7 @@ if [ "$MODE" = cable ]; then
     # on the real machine 21 Nov 2026. hostapd plus dnsmasq on ap0 is the stack that works,
     # and the stack a Raspberry Pi would run, which is the point of proving cable mode at all.
     CH=6
-    start_ap_on "$CH"
+    start_ap_on "$CH" cable
 
     say "mode        : cable, cable is the uplink, wi-fi radio dedicated to the AP"
     say "uplink      : $UP_IF  $(ip -4 -br addr show "$UP_IF" | awk '{print $3}')"
@@ -628,7 +642,7 @@ else
     fi
     ap_capable "$CH" || die "uplink ended up on channel $CH, still not beaconable"
 
-    start_ap_on "$CH"
+    start_ap_on "$CH" wifi
 
     say "mode        : wifi, wi-fi is the uplink and the AP rides its channel"
     say "uplink      : $WIFI_IF on channel $CH"
