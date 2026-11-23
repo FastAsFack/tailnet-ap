@@ -47,22 +47,26 @@ VERSION=1.1.4
 # first reads the head SHA and pins the file URL to that commit.
 REPO_API=https://api.github.com/repos/FastAsFack/tailnet-ap
 REPO_RAW=$REPO_API/contents/tailnet-ap?ref=main
+# The values below are the built-in defaults. load_config, called from main, lays the
+# settings file and then any TAILNET_AP_* variable over them; sourcing does not.
+# The network name. Override with SSID in the settings file or TAILNET_AP_SSID.
 SSID=thinkpad-tailnet
 HOSTIP=10.42.7.1
 PREFIX=24
 # Interface names differ by machine: enp0s31f6 / wlp3s0 on the ThinkPad, eth0 / wlan0 on
 # a Raspberry Pi. These defaults are the ThinkPad's; detect_ifaces() swaps in the real
-# ones when those names are not present. Override with TAILNET_AP_UPLINK / TAILNET_AP_WIFI.
-UP_IF=${TAILNET_AP_UPLINK:-enp0s31f6}
-WIFI_IF=${TAILNET_AP_WIFI:-wlp3s0}
+# ones when those names are not present. Override with UP_IF / WIFI_IF in the settings
+# file or TAILNET_AP_UPLINK / TAILNET_AP_WIFI.
+UP_IF=enp0s31f6
+WIFI_IF=wlp3s0
 AP_IF=ap0
 # Regulatory country for hostapd. A Pi often has no country set and then hostapd refuses
-# the radio. Override with TAILNET_AP_COUNTRY.
-COUNTRY=${TAILNET_AP_COUNTRY:-NL}
-# Tailnet domain and an optional static host shortcut. The defaults are this homelab's;
-# a friend overrides both. TAILNET_AP_HOSTRECORD= (empty) turns the shortcut off.
-DOMAIN=${TAILNET_AP_DOMAIN:-taile8e387.ts.net}
-HOSTRECORD=${TAILNET_AP_HOSTRECORD:-raspberry-server,100.116.252.86}
+# the radio. Override with COUNTRY in the settings file or TAILNET_AP_COUNTRY.
+COUNTRY=NL
+# An optional static host shortcut for dnsmasq, NAME,ADDRESS (for example
+# nas,100.64.0.10). Empty, the default, writes no host-record line at all. Override with
+# HOSTRECORD in the settings file or TAILNET_AP_HOSTRECORD.
+HOSTRECORD=
 # Upstream DNS for dnsmasq. Empty means detect: systemd-resolved (127.0.0.53), else
 # Tailscale's resolver, else the first nameserver in /etc/resolv.conf.
 DNS_UPSTREAM=${TAILNET_AP_DNS:-}
@@ -74,8 +78,13 @@ NMDIR=/etc/NetworkManager/system-connections
 HOSTAPD_CONF=/etc/hostapd/tailnet-ap.conf
 # The user who owns the desktop. On the ThinkPad that is tijnb, not the admin hermes;
 # on a fresh Pi or Ubuntu box it is whatever user was created first. Detected in
-# detect_desktop_user, overridable with TAILNET_AP_USER.
-DESKTOP_USER=${TAILNET_AP_USER:-}
+# detect_desktop_user, overridable with DESKTOP_USER in the settings file or
+# TAILNET_AP_USER.
+DESKTOP_USER=
+# The settings file, and the settings it may hold, in the order install writes them.
+# No secret lives in it: the key stays in $PSKFILE.
+CONFFILE=/etc/tailnet-ap.conf
+CONF_KEYS="SSID COUNTRY HOSTIP PREFIX HOSTRECORD UP_IF WIFI_IF DESKTOP_USER"
 
 die() { echo "tailnet-ap: $*" >&2; exit 1; }
 say() { printf '%s\n' "$*"; }
@@ -86,6 +95,63 @@ pkg_hint() {
     elif command -v apt-get >/dev/null 2>&1; then echo "apt install $*"
     else echo "install $* with your package manager"
     fi
+}
+
+# ---- settings ----
+
+# conf_text: the settings file as install writes it, from the settings as they are now.
+conf_text() {
+    local key
+    cat <<'HDR'
+# /etc/tailnet-ap.conf - the settings for tailnet-ap.
+#
+# 'tailnet-ap install' writes this file once, from the built-in defaults plus any
+# TAILNET_AP_* variable set at that moment. A later install or update keeps it as it
+# is, so edits made here stay.
+#
+# Plain KEY=value lines, no quotes: everything after the first = is the value. An
+# empty value means the built-in default. A TAILNET_AP_* variable still overrides a
+# line here, for that one run. Lines starting with # are ignored.
+#
+# UP_IF and WIFI_IF: when the named interface is not on this machine, one is detected.
+# DESKTOP_USER empty: detected. HOSTRECORD empty: no host-record for dnsmasq.
+# HOSTRECORD and DESKTOP_USER are used by install: run it again after changing them.
+# No secret lives here: the Wi-Fi key is in /etc/hostapd/tailnet-ap.psk.
+HDR
+    for key in $CONF_KEYS; do printf '%s=%s\n' "$key" "${!key}"; done
+}
+
+# load_config: the settings for this run. The built-in defaults above, then $CONFFILE
+# when it exists, then any TAILNET_AP_* variable that is set and not empty, which wins
+# for this run only. An empty value in the file keeps the default, and a line that is
+# not one of $CONF_KEYS is reported and ignored. The file is parsed, never sourced.
+# Called from main before detection, never at source time, so sourcing this file reads
+# nothing from the host. It also keeps the settings as they are before detection fills
+# anything in, in CONF_TEXT, which is what install writes.
+load_config() {
+    local line key val
+    if [ -r "$CONFFILE" ]; then
+        while IFS= read -r line || [ -n "$line" ]; do
+            case "$line" in
+                ""|"#"*) continue ;;
+                *=*) ;;
+                *) echo "tailnet-ap: $CONFFILE: ignoring a line with no '=': $line" >&2; continue ;;
+            esac
+            key=${line%%=*}
+            val=${line#*=}
+            case " $CONF_KEYS " in
+                *" $key "*) [ -n "$val" ] && printf -v "$key" '%s' "$val" ;;
+                *) echo "tailnet-ap: $CONFFILE: ignoring an unknown setting: $key" >&2 ;;
+            esac
+        done < "$CONFFILE"
+    fi
+    [ -n "${TAILNET_AP_SSID:-}" ]       && SSID=$TAILNET_AP_SSID
+    [ -n "${TAILNET_AP_COUNTRY:-}" ]    && COUNTRY=$TAILNET_AP_COUNTRY
+    [ -n "${TAILNET_AP_HOSTRECORD:-}" ] && HOSTRECORD=$TAILNET_AP_HOSTRECORD
+    [ -n "${TAILNET_AP_UPLINK:-}" ]     && UP_IF=$TAILNET_AP_UPLINK
+    [ -n "${TAILNET_AP_WIFI:-}" ]       && WIFI_IF=$TAILNET_AP_WIFI
+    [ -n "${TAILNET_AP_USER:-}" ]       && DESKTOP_USER=$TAILNET_AP_USER
+    CONF_TEXT=$(conf_text)
 }
 
 # detect_ifaces: swap in the real interface names when the compiled-in defaults are not
@@ -817,9 +883,12 @@ filter-AAAA
 # domain-needed is deliberately NOT set: it makes dnsmasq refuse any name without a
 # dot, so "raspberry-server" never reaches the resolver. Measured 21 Nov 2026.
 # No domain-search: it made Android append taile8e387.ts.net to connectivitycheck and
-# google, get NXDOMAIN, and report "no internet". The host-record covers the bare name.
-host-record=${HOSTRECORD:-raspberry-server,100.116.252.86}
+# google, get NXDOMAIN, and report "no internet". A host-record, if set, covers a bare name.
 CONF
+    # The host shortcut is optional: with HOSTRECORD empty there is no host-record line.
+    if [ -n "$HOSTRECORD" ]; then
+        echo "host-record=$HOSTRECORD" >> /etc/dnsmasq.d/tailnet-ap.conf
+    fi
 
     local hostapd_bin
     hostapd_bin=$(command -v hostapd || echo /usr/sbin/hostapd)
@@ -902,6 +971,17 @@ CONF
         say "  WARNING: tailscale is not installed"
         say "           clients would reach this host only, not the tailnet"
         say "           install it first:  $(pkg_hint tailscale) && tailscale up"
+    fi
+
+    say "install: settings"
+    # Written once, like the key: an operator's settings are never silently replaced.
+    # CONF_TEXT is the defaults plus any TAILNET_AP_* variable, from load_config.
+    if [ -e "$CONFFILE" ]; then
+        say "  keeping the existing settings in $CONFFILE"
+    else
+        printf '%s\n' "$CONF_TEXT" > "$CONFFILE"
+        chmod 644 "$CONFFILE"
+        say "  $CONFFILE written"
     fi
 
     say "install: network key"
@@ -1263,6 +1343,7 @@ do_key_set() {
 # ---------------- dispatch ----------------
 main() {
     SELF=$(readlink -f "$0")
+    load_config
     detect_ifaces
     detect_dns_upstream
     detect_desktop_user

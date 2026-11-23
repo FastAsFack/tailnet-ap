@@ -28,7 +28,8 @@ Normal internet keeps leaving through the laptop's own uplink.
 
 Run `tailnet-ap doctor` on a new machine. It lists the interfaces it found and every
 tool that is present or missing. `install` also picks the desktop user itself: the
-sudo caller, the first regular user, or you. Override with `TAILNET_AP_USER`.
+sudo caller, the first regular user, or you. Override it with `DESKTOP_USER` (see
+[Settings](#settings)).
 
 ## Ubuntu / Debian
 
@@ -52,8 +53,9 @@ sudo tailnet-ap on --mode cable
 Pi notes:
 - Use `--mode cable`. The single radio is then free for the AP. `--mode wifi` also
   works, but the AP must share the uplink's channel.
-- If the radio refuses to start, set the country: `sudo TAILNET_AP_COUNTRY=NL
-  ./tailnet-ap install`. `doctor` shows which country is in use.
+- If the radio refuses to start, set the country: `COUNTRY=NL` in
+  `/etc/tailnet-ap.conf`, or `sudo TAILNET_AP_COUNTRY=NL ./tailnet-ap install` the
+  first time, which writes it there. `doctor` shows which country is in use.
 - The 3B+ radio can beacon on 2.4 GHz reliably. If 5 GHz refuses, stay on 2.4 GHz.
 
 ## Install
@@ -63,8 +65,47 @@ sudo ./tailnet-ap install
 ```
 
 This writes the static configs, generates a 10-character Wi-Fi key on first run
-and keeps it on later runs, installs the program to `/usr/local/bin/tailnet-ap`,
-and puts a launcher on the desktop.
+and keeps it on later runs, writes the settings file on first run and keeps it on
+later runs, installs the program to `/usr/local/bin/tailnet-ap`, and puts a
+launcher on the desktop.
+
+## Settings
+
+The settings live in `/etc/tailnet-ap.conf`: plain `KEY=value` lines, no quotes,
+`644` and root-owned. It holds no secret; the Wi-Fi key stays in
+`/etc/hostapd/tailnet-ap.psk`. `install` writes it once, from the built-in
+defaults plus any `TAILNET_AP_*` variable set at that moment. When the file
+already exists, `install` leaves it alone and prints `keeping the existing
+settings`, the same rule as for the key; `update`, which reruns `install`, keeps it
+too. Edit it with `sudo`.
+
+At run time each setting is taken from, later winning over earlier:
+
+1. the built-in default,
+2. `/etc/tailnet-ap.conf`, when it exists,
+3. the `TAILNET_AP_*` variable, when it is set and not empty, for that one run only.
+
+An empty value in the file keeps the built-in default. The file is what reaches the
+Desktop launcher: it runs `toggle` through `pkexec`, which clears the environment,
+so a `TAILNET_AP_*` variable never gets that far.
+
+| Setting | Override | Default | What it does |
+|---|---|---|---|
+| `SSID` | `TAILNET_AP_SSID` | `thinkpad-tailnet` | The network name the access point broadcasts. |
+| `COUNTRY` | `TAILNET_AP_COUNTRY` | `NL` | Regulatory country for hostapd; without one a Pi refuses the radio. |
+| `HOSTIP` | none | `10.42.7.1` | Address of `ap0`, the clients' gateway and DNS server. |
+| `PREFIX` | none | `24` | Prefix length of the AP subnet. |
+| `HOSTRECORD` | `TAILNET_AP_HOSTRECORD` | empty | `NAME,ADDRESS` that dnsmasq answers for a bare name; empty writes no `host-record=` line. |
+| `UP_IF` | `TAILNET_AP_UPLINK` | `enp0s31f6` | The uplink interface; detected when it is not on this machine. |
+| `WIFI_IF` | `TAILNET_AP_WIFI` | `wlp3s0` | The Wi-Fi radio; detected when it is not on this machine. |
+| `DESKTOP_USER` | `TAILNET_AP_USER` | empty | Whose Desktop gets the launcher; empty means detect it. |
+
+`HOSTRECORD` and `DESKTOP_USER` are used by `install`, so run it again after
+changing them. Leave `HOSTIP` and `PREFIX` at their defaults for now: the DHCP
+range, the dnsmasq gateway and DNS options and the advertised route are still
+written as `10.42.7.0/24`. `TAILNET_AP_DNS` (the dnsmasq upstream) and
+`TAILNET_AP_ZONE` (the firewalld zone) are not in the file: only `install` reads
+them, so pass them to `install` when you need them.
 
 ## Use
 

@@ -7,6 +7,35 @@ changed, and how it was checked. The program prints its own version with
 Versions are `MAJOR.MINOR.PATCH`. `1.1.0` is the first release that runs outside
 Fedora.
 
+## Unreleased
+
+- **One settings file, `/etc/tailnet-ap.conf`.** Plain `KEY=value` lines, `644`,
+  root-owned, no secret (the key stays in `/etc/hostapd/tailnet-ap.psk`). It holds
+  `SSID`, `COUNTRY`, `HOSTIP`, `PREFIX`, `HOSTRECORD`, `UP_IF`, `WIFI_IF` and
+  `DESKTOP_USER`. At run time a setting is the built-in default, then the file,
+  then a non-empty `TAILNET_AP_*` variable for that one run. `load_config` parses
+  the file (it is never sourced) from `main`, before interface and DNS detection,
+  so sourcing the program still reads nothing from the host. Why: the Desktop
+  launcher runs `toggle` through `pkexec`, which clears the environment, so every
+  `TAILNET_AP_*` override set before `install` was gone by then.
+- **`install` writes the settings file once**, from the built-in defaults plus any
+  `TAILNET_AP_*` variable set at that moment. When the file exists it is kept and
+  `install` prints `keeping the existing settings`, the same rule as the key.
+- **`SSID` has an override, `TAILNET_AP_SSID`.** It was hard-coded.
+- **`HOSTRECORD` defaults to empty, and empty writes no `host-record=` line.** The
+  default was `raspberry-server,100.116.252.86`, the author's Pi, and the dnsmasq
+  drop-in repeated it as a fallback, so every install answered for that host. A
+  host that relied on it: put `HOSTRECORD=raspberry-server,100.116.252.86` in
+  `/etc/tailnet-ap.conf` and run `sudo tailnet-ap install`. `update` reruns
+  `install`, so updating without that line drops the record.
+- **Removed `DOMAIN` and `TAILNET_AP_DOMAIN`.** The variable was set and never
+  read.
+- The `TAILNET_AP_*` variables are now applied in `load_config`, after the file,
+  instead of when the program is sourced. The built-in defaults are plain values.
+
+Checked: not yet. `tests/run-tests.sh` does not cover `load_config` or the new
+`install` step; both need a run on a real host before release.
+
 ## 1.1.4 - 2026-11-21
 
 - **`tailnet-ap update --test`.** Builds a copy of the installed program with
