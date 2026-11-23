@@ -100,10 +100,12 @@ so a `TAILNET_AP_*` variable never gets that far.
 | `WIFI_IF` | `TAILNET_AP_WIFI` | `wlp3s0` | The Wi-Fi radio; detected when it is not on this machine. |
 | `DESKTOP_USER` | `TAILNET_AP_USER` | empty | Whose Desktop gets the launcher; empty means detect it. |
 
-`HOSTRECORD` and `DESKTOP_USER` are used by `install`, so run it again after
-changing them. Leave `HOSTIP` and `PREFIX` at their defaults for now: the DHCP
-range, the dnsmasq gateway and DNS options and the advertised route are still
-written as `10.42.7.0/24`. `TAILNET_AP_DNS` (the dnsmasq upstream) and
+`HOSTIP`, `PREFIX`, `HOSTRECORD` and `DESKTOP_USER` are used by `install`, so run
+it again after changing them. The DHCP range, the dnsmasq gateway and DNS options
+and the advertised route all follow `HOSTIP` and `PREFIX`. The range is the same
+share of the subnet as `.50` to `.200` of a `/24`, and never `HOSTIP` itself.
+`HOSTIP` must be a host address in its subnet and `PREFIX` 8 to 30; `install`,
+`on` and `doctor` say so when they are not. `TAILNET_AP_DNS` (the dnsmasq upstream) and
 `TAILNET_AP_ZONE` (the firewalld zone) are not in the file: only `install` reads
 them, so pass them to `install` when you need them.
 
@@ -156,7 +158,9 @@ printed during install. `tailnet-ap key` shows it on demand.
 
 ## How the clients reach the tailnet
 
-The AP subnet `10.42.7.0/24` is advertised to the tailnet. The first time, the
+`on` adds the AP subnet (`10.42.7.0/24` by default) to the routes this host
+advertises to the tailnet, keeping the ones it already advertises, and `off`
+withdraws it again, and only it. The first time, the
 route needs approving in the Tailscale admin console. After that it stays
 approved. The AP's DNS forwards to the laptop's resolver, so MagicDNS names work
 on the clients.
@@ -173,7 +177,7 @@ masquerades them, so they appear as the AP host.
 bash tests/run-tests.sh
 ```
 
-116 checks, no root needed. The suite uses stubs and never touches the real
+117 checks, no root needed. The suite uses stubs and never touches the real
 radio.
 
 ## Notes

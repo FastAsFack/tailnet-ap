@@ -597,6 +597,26 @@ check "mode A releases the radio before bringing the AP up" \
 check "the off script gives the wi-fi back once the AP is down" \
       grep -q 'giving the wi-fi back' "$OFF"
 
+# ---- the active uplink ----
+section "the firewall names the active uplink: the wi-fi in wifi mode, not the cable"
+# ap_rules MODE: run start_ap_on in MODE, in a subshell, with iptables as the firewall and
+# every command that would change the machine stubbed. -C finds no rule, so every rule is
+# inserted; the inserts are recorded, not made. Prints the ones that name the uplink, so
+# not the tailscale0 or INPUT rules.
+ap_rules() {
+    ( MADE="" PSK=$PSK_T
+      sleep() { :; }; ip() { :; }; iw() { :; }; systemctl() { :; }
+      fw_backend() { echo iptables; }
+      iptables() { case " $* " in *" -C "*) return 1 ;; esac; MADE="$MADE$*"$'\n'; }
+      start_ap_on 6 "$1" >/dev/null 2>&1
+      printf '%s' "$MADE" | grep -v -e tailscale0 -e ' INPUT ' )
+}
+same "wifi mode: client traffic is masqueraded and forwarded out of wlp3s0, not enp0s31f6" \
+    "-t nat -I POSTROUTING -s 10.42.7.1/24 -o wlp3s0 -j MASQUERADE
+-I FORWARD -i ap0 -o wlp3s0 -j ACCEPT
+-I FORWARD -i wlp3s0 -o ap0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT" \
+    "$(ap_rules wifi)"
+
 section "safety"
 if [ -s "$SCRATCH/refused" ]; then
     bad "nothing that changes the machine was called" "$(tr '\n' ';' < "$SCRATCH/refused")"

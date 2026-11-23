@@ -32,9 +32,36 @@ Fedora.
   read.
 - The `TAILNET_AP_*` variables are now applied in `load_config`, after the file,
   instead of when the program is sourced. The built-in defaults are plain values.
+- **`--mode wifi` clients reach the internet on iptables and nft hosts.** The
+  masquerade and FORWARD rules named `UP_IF`, the cable, in both modes, so in wifi
+  mode on Debian, Ubuntu and Raspberry Pi OS clients reached the tailnet and
+  nothing else. `fw_apply` and `fw_remove` now take the uplink: `start_ap_on`
+  passes the cable in cable mode and the Wi-Fi in wifi mode, and `stop_ap` drops
+  the rules for both, because it cannot know the previous run's mode. firewalld
+  was not affected: it masquerades the whole zone.
+- **`on` adds the AP subnet to the advertised routes instead of replacing them,
+  and `off` withdraws it.** `tailscale set --advertise-routes` replaces the whole
+  list, so a host that advertised its LAN or an exit node lost it, and `off` never
+  withdrew the AP subnet. Both now read the list from `tailscale debug prefs`
+  (`adv_routes`, which `doctor` uses too): `on` sets it plus the AP subnet, `off`
+  sets it minus the AP subnet and nothing else. A list that cannot be read is
+  left alone, and a missing or logged-out tailscale is one line, not a failed run.
+- **One run at a time.** Every command that needs root takes an exclusive `flock`
+  on `/run/tailnet-ap.lock` before `main` and stops with a message when another
+  run holds it. The lock goes with the process. `update` lets go of it before it
+  reruns `install`, which takes it too.
+- **`HOSTIP` and `PREFIX` are used everywhere.** The DHCP range, the dnsmasq
+  router and DNS options, the advertised route, the sysctl note and the `doctor`
+  check were written for `10.42.7.0/24`. `ap_subnet` derives them, keeping the
+  range inside the subnet and off `HOSTIP`; the defaults give the same drop-in as
+  before. `install` and `on` stop on settings that make no usable subnet.
 
 Checked: not yet. `tests/run-tests.sh` does not cover `load_config` or the new
-`install` step; both need a run on a real host before release.
+`install` step; both need a run on a real host before release. The suite has 117
+checks now: the new one runs `start_ap_on` in wifi mode against a stubbed
+iptables and checks that the masquerade and FORWARD rules name `wlp3s0`. The
+route handling, the lock and `ap_subnet` are not in the suite and need the same
+real-host run.
 
 ## 1.1.4 - 2026-11-21
 

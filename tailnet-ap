@@ -85,6 +85,9 @@ DESKTOP_USER=
 # No secret lives in it: the key stays in $PSKFILE.
 CONFFILE=/etc/tailnet-ap.conf
 CONF_KEYS="SSID COUNTRY HOSTIP PREFIX HOSTRECORD UP_IF WIFI_IF DESKTOP_USER"
+# One run at a time: every command that needs root holds an exclusive flock on this file.
+# The lock goes with the process, so the file left behind blocks nothing.
+LOCKFILE=/run/tailnet-ap.lock
 
 die() { echo "tailnet-ap: $*" >&2; exit 1; }
 say() { printf '%s\n' "$*"; }
@@ -115,7 +118,8 @@ conf_text() {
 #
 # UP_IF and WIFI_IF: when the named interface is not on this machine, one is detected.
 # DESKTOP_USER empty: detected. HOSTRECORD empty: no host-record for dnsmasq.
-# HOSTRECORD and DESKTOP_USER are used by install: run it again after changing them.
+# HOSTIP, PREFIX, HOSTRECORD and DESKTOP_USER are used by install: run it again after
+# changing them. HOSTIP must be a host address in its subnet, PREFIX 8 to 30.
 # No secret lives here: the Wi-Fi key is in /etc/hostapd/tailnet-ap.psk.
 HDR
     for key in $CONF_KEYS; do printf '%s=%s\n' "$key" "${!key}"; done
@@ -217,6 +221,90 @@ detect_desktop_user() {
     u=$(getent passwd 1000 2>/dev/null | cut -d: -f1)
     [ -n "$u" ] && { DESKTOP_USER=$u; return 0; }
     DESKTOP_USER=$(id -un)
+}
+
+# ---- the AP subnet and its route ----
+
+# ip4_dotted N: the 32-bit number N as A.B.C.D.
+ip4_dotted() {
+    printf '%d.%d.%d.%d\n' $(( ($1 >> 24) & 255 )) $(( ($1 >> 16) & 255 )) \
+        $(( ($1 >> 8) & 255 )) $(( $1 & 255 ))
+}
+
+# ap_subnet: everything the AP hands out or advertises, from HOSTIP and PREFIX. Sets
+# AP_NET (the route on adds and off withdraws), AP_MASK, and AP_DHCP_FIRST and
+# AP_DHCP_LAST, the DHCP range: the same share of the subnet as .50 to .200 of a /24,
+# kept inside it and off HOSTIP itself. The defaults give 10.42.7.0/24, 255.255.255.0,
+# 10.42.7.50 and 10.42.7.200, the values that used to be written out by hand. Fails,
+# setting nothing, unless HOSTIP is a host address of its subnet and PREFIX is 8 to 30.
+ap_subnet() {
+    local o host=0 size mask net first last
+    [[ $PREFIX =~ ^[1-9][0-9]?$ ]] && [ "$PREFIX" -ge 8 ] && [ "$PREFIX" -le 30 ] || return 1
+    [[ $HOSTIP =~ ^(0|[1-9][0-9]{0,2})(\.(0|[1-9][0-9]{0,2})){3}$ ]] || return 1
+    for o in ${HOSTIP//./ }; do
+        [ "$o" -le 255 ] || return 1
+        host=$(( (host << 8) | o ))
+    done
+    size=$(( 1 << (32 - PREFIX) ))
+    mask=$(( (0xFFFFFFFF << (32 - PREFIX)) & 0xFFFFFFFF ))
+    net=$(( host & mask ))
+    # not the network address and not the broadcast address
+    [ "$host" -gt "$net" ] && [ "$host" -lt $(( net + size - 1 )) ] || return 1
+    first=$(( net + size * 50 / 256 ))
+    last=$(( net + size * 200 / 256 ))
+    [ "$first" -gt "$net" ] || first=$(( net + 1 ))
+    [ "$last" -lt $(( net + size - 1 )) ] || last=$(( net + size - 2 ))
+    # HOSTIP inside the range: keep the larger part on either side of it
+    if [ "$host" -ge "$first" ] && [ "$host" -le "$last" ]; then
+        if [ $(( host - first )) -ge $(( last - host )) ]; then
+            last=$(( host - 1 ))
+        else
+            first=$(( host + 1 ))
+        fi
+    fi
+    [ "$first" -le "$last" ] || return 1
+    AP_NET=$(ip4_dotted "$net")/$PREFIX
+    AP_MASK=$(ip4_dotted "$mask")
+    AP_DHCP_FIRST=$(ip4_dotted "$first")
+    AP_DHCP_LAST=$(ip4_dotted "$last")
+}
+
+# adv_routes: the routes this host advertises to the tailnet, comma-separated, from the
+# AdvertiseRoutes list in "tailscale debug prefs". Prints nothing when there are none.
+# Fails when the list cannot be read, which is not the same as an empty list: on and off
+# then leave the routes alone rather than set a list built on a guess. The JSON spreads
+# the list over several lines, so without python3 an awk reads it, not a one-line grep.
+adv_routes() {
+    local prefs
+    prefs=$(tailscale debug prefs 2>/dev/null) && [ -n "$prefs" ] || return 1
+    if command -v python3 >/dev/null 2>&1; then
+        printf '%s' "$prefs" | python3 -c "import json,sys; d=json.load(sys.stdin); print(','.join(d.get('AdvertiseRoutes') or []))" 2>/dev/null
+        return
+    fi
+    printf '%s\n' "$prefs" | awk '
+        !on && /"AdvertiseRoutes":/ { on = 1; sub(/.*"AdvertiseRoutes":/, "") }
+        on { s = s $0; if (s ~ /[]]|null/) exit }
+        END {
+            if (!on || s !~ /[]]|null/) exit 1
+            sub(/[]].*/, "", s); gsub(/null|[" \t[]/, "", s); sub(/,$/, "", s)
+            print s
+        }'
+}
+
+# routes_with LIST ROUTE: the comma-separated LIST with ROUTE added at the end, unless it
+# is in it already. routes_without LIST ROUTE: LIST without ROUTE, the rest in order.
+routes_with() {
+    case ",$1," in
+        *",$2,"*) printf '%s\n' "$1" ;;
+        *)        printf '%s\n' "${1:+$1,}$2" ;;
+    esac
+}
+routes_without() {
+    local r out="" IFS=,
+    for r in $1; do
+        [ -n "$r" ] && [ "$r" != "$2" ] && out=${out:+$out,}$r
+    done
+    printf '%s\n' "$out"
 }
 
 # ---- argument parsing ----
@@ -405,17 +493,19 @@ fw_zone() {
     [ -n "$z" ] && echo "$z" || echo FedoraWorkstation
 }
 
-# fw_apply: open the AP path when firewalld is not the manager. Idempotent: -C checks
-# first, and -I puts the rule in front of ufw's or the distro's own FORWARD rules.
+# fw_apply UPLINK: open the AP path when firewalld is not the manager. UPLINK is where
+# the clients' internet traffic leaves: $UP_IF in cable mode, $WIFI_IF in wifi mode
+# ($UP_IF when not given). Idempotent: -C checks first, and -I puts the rule in front of
+# ufw's or the distro's own FORWARD rules.
 fw_apply() {
-    local rule
+    local rule up=${1:-$UP_IF}
     case "$(fw_backend)" in
         iptables)
             for rule in \
-                "-t nat -C POSTROUTING -s $HOSTIP/$PREFIX -o $UP_IF -j MASQUERADE" \
+                "-t nat -C POSTROUTING -s $HOSTIP/$PREFIX -o $up -j MASQUERADE" \
                 "-t nat -C POSTROUTING -s $HOSTIP/$PREFIX -o tailscale0 -j MASQUERADE" \
-                "-C FORWARD -i $AP_IF -o $UP_IF -j ACCEPT" \
-                "-C FORWARD -i $UP_IF -o $AP_IF -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT" \
+                "-C FORWARD -i $AP_IF -o $up -j ACCEPT" \
+                "-C FORWARD -i $up -o $AP_IF -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT" \
                 "-C FORWARD -i $AP_IF -o tailscale0 -j ACCEPT" \
                 "-C FORWARD -i tailscale0 -o $AP_IF -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT" \
                 "-C INPUT -i $AP_IF -p udp --dport 67 -j ACCEPT" \
@@ -437,7 +527,7 @@ table inet tailnet_ap {
     }
     chain postrouting {
         type nat hook postrouting priority srcnat; policy accept;
-        ip saddr $HOSTIP/$PREFIX oifname "$UP_IF" masquerade
+        ip saddr $HOSTIP/$PREFIX oifname "$up" masquerade
         ip saddr $HOSTIP/$PREFIX oifname "tailscale0" masquerade
     }
     chain input {
@@ -452,16 +542,17 @@ NFT
     esac
 }
 
-# fw_remove: drop the same rules, so off leaves no open door behind.
+# fw_remove UPLINK: drop the same rules, so off leaves no open door behind. UPLINK as
+# for fw_apply.
 fw_remove() {
-    local rule
+    local rule up=${1:-$UP_IF}
     case "$(fw_backend)" in
         iptables)
             for rule in \
-                "-t nat -D POSTROUTING -s $HOSTIP/$PREFIX -o $UP_IF -j MASQUERADE" \
+                "-t nat -D POSTROUTING -s $HOSTIP/$PREFIX -o $up -j MASQUERADE" \
                 "-t nat -D POSTROUTING -s $HOSTIP/$PREFIX -o tailscale0 -j MASQUERADE" \
-                "-D FORWARD -i $AP_IF -o $UP_IF -j ACCEPT" \
-                "-D FORWARD -i $UP_IF -o $AP_IF -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT" \
+                "-D FORWARD -i $AP_IF -o $up -j ACCEPT" \
+                "-D FORWARD -i $up -o $AP_IF -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT" \
                 "-D FORWARD -i $AP_IF -o tailscale0 -j ACCEPT" \
                 "-D FORWARD -i tailscale0 -o $AP_IF -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT" \
                 "-D INPUT -i $AP_IF -p udp --dport 67 -j ACCEPT" \
@@ -478,7 +569,10 @@ fw_remove() {
 }
 
 stop_ap() {
-    fw_remove
+    # The rules a previous run left name the uplink of its mode, which need not be this
+    # run's, so drop them for each interface that can be the uplink.
+    fw_remove "$UP_IF"
+    [ "$WIFI_IF" = "$UP_IF" ] || fw_remove "$WIFI_IF"
     systemctl stop "$HOSTAPD_UNIT" >/dev/null 2>&1
     systemctl stop dnsmasq >/dev/null 2>&1
     if [ -d "/sys/class/net/$AP_IF" ]; then
@@ -519,7 +613,10 @@ start_ap_on() {
 
     systemctl start dnsmasq >/dev/null 2>&1
     sleep 2
-    fw_apply
+    # The clients' internet traffic leaves by the active uplink: the cable in cable mode,
+    # the wi-fi in wifi mode. Rules naming $UP_IF in wifi mode masqueraded and forwarded
+    # nothing, so on iptables and nft the clients reached the tailnet and not the internet.
+    if [ "$mode" = cable ]; then fw_apply "$UP_IF"; else fw_apply "$WIFI_IF"; fi
 }
 
 restore_uplink() {
@@ -621,6 +718,7 @@ decide_mode "$MODE"
 [ -r "$PSKFILE" ] || die "no key at $PSKFILE"
 PSK=$(cat "$PSKFILE")
 [ -n "$PSK" ] || die "the key file is empty"
+ap_subnet || die "HOSTIP=$HOSTIP PREFIX=$PREFIX is not a subnet the AP can use: HOSTIP must be a host address in it and PREFIX 8 to 30 (see $CONFFILE)"
 
 
 # start_ap_on CH: everything both modes share once a channel is decided: the virtual AP
@@ -741,13 +839,18 @@ fi
 # This program does not install Tailscale: it is a separate client that has to be
 # installed and logged in first. Without it the AP still works, but clients only
 # reach this host, not the rest of the tailnet.
+# --advertise-routes replaces the whole list, so the AP subnet is added to the routes this
+# host already advertises (its own LAN, an exit node), never put in their place. A list
+# that cannot be read is left alone.
 if ! command -v tailscale >/dev/null 2>&1; then
     say "route       : tailscale is NOT installed, so clients cannot reach the tailnet"
     say "              install it first:  $(pkg_hint tailscale) && tailscale up"
-elif tailscale set --advertise-routes=10.42.7.0/24 >/dev/null 2>&1; then
-    say "route       : 10.42.7.0/24 advertised to the tailnet"
+elif ! ROUTES=$(adv_routes); then
+    say "route       : could not read the advertised routes, so $AP_NET was not added (is tailscale up?)"
+elif tailscale set --advertise-routes="$(routes_with "$ROUTES" "$AP_NET")" >/dev/null 2>&1; then
+    say "route       : $AP_NET advertised to the tailnet"
 else
-    say "route       : could not advertise 10.42.7.0/24 (is tailscale up?)"
+    say "route       : could not advertise $AP_NET (is tailscale up?)"
 fi
 
 unset PSK 2>/dev/null || true
@@ -817,6 +920,27 @@ if ! wifi_connected; then
     wifi_connected || echo "warning: the wi-fi did not come back by itself. Run:  nmcli dev connect $WIFI_IF"
 fi
 
+# Withdraw the AP subnet from the tailnet, and only it: every other route this host
+# advertises is set back as it was. It comes after the wi-fi is back, so a slow or hung
+# tailscale cannot hold up the link, and a missing or logged-out one is one line, never a
+# failed off.
+if ! command -v tailscale >/dev/null 2>&1; then
+    echo "tailscale is not installed, so there is no route to withdraw"
+elif ! ap_subnet; then
+    echo "warning: HOSTIP=$HOSTIP PREFIX=$PREFIX is not a usable subnet, so no route was withdrawn"
+elif ! ROUTES=$(adv_routes); then
+    echo "warning: could not read the advertised routes, so $AP_NET may still be advertised (is tailscale up?)"
+else
+    case ",$ROUTES," in
+        *",$AP_NET,"*)
+            if tailscale set --advertise-routes="$(routes_without "$ROUTES" "$AP_NET")" >/dev/null 2>&1; then
+                echo "route $AP_NET withdrawn from the tailnet"
+            else
+                echo "warning: could not withdraw $AP_NET from the tailnet (is tailscale up?)"
+            fi ;;
+    esac
+fi
+
 echo "tailnet AP is down."
 nmcli -t -f DEVICE,STATE,CONNECTION dev status | grep -E "^($WIFI_IF|$AP_IF|enp0s31f6):"
 iw dev "$WIFI_IF" link 2>/dev/null | grep -E "SSID|freq"
@@ -843,6 +967,9 @@ do_install() {
         command -v "$t" >/dev/null 2>&1 \
             || die "$t is missing. Install it: $(pkg_hint "$t")"
     done
+    # The DHCP range, the router and DNS options and the sysctl note come from HOSTIP and
+    # PREFIX, so settings that make no usable subnet stop install before it writes anything.
+    ap_subnet || die "HOSTIP=$HOSTIP PREFIX=$PREFIX is not a subnet the AP can use: HOSTIP must be a host address in it and PREFIX 8 to 30 (see $CONFFILE)"
     local userhome desktop
     userhome=$(getent passwd "$hostuser" | cut -d: -f6)
     [ -n "$userhome" ] || die "no home directory for $hostuser"
@@ -871,9 +998,9 @@ CONF
 # DHCP and DNS for clients on the virtual AP interface ap0.
 interface=ap0
 bind-dynamic
-dhcp-range=10.42.7.50,10.42.7.200,255.255.255.0,12h
-dhcp-option=option:router,10.42.7.1
-dhcp-option=option:dns-server,10.42.7.1
+dhcp-range=$AP_DHCP_FIRST,$AP_DHCP_LAST,$AP_MASK,12h
+dhcp-option=option:router,$HOSTIP
+dhcp-option=option:dns-server,$HOSTIP
 no-resolv
 server=$DNS_UPSTREAM
 bogus-priv
@@ -906,8 +1033,8 @@ Restart=no
 WantedBy=multi-user.target
 CONF
 
-    cat > /etc/sysctl.d/60-tailnet-ap.conf <<'CONF'
-# Tailnet AP: let clients on 10.42.7.0/24 be routed to the tailnet and out.
+    cat > /etc/sysctl.d/60-tailnet-ap.conf <<CONF
+# Tailnet AP: let clients on $AP_NET be routed to the tailnet and out.
 net.ipv4.ip_forward = 1
 CONF
 
@@ -1172,6 +1299,8 @@ do_update() {
     rm -f "$tmp"
     # Refresh the drop-ins, unit and launcher with the new program. The self-copy guard
     # sees it is already in place and skips the copy, but everything else is rewritten.
+    # That install is a second run and takes the run lock itself, so let go of it first.
+    flock -u 9 2>/dev/null || true
     /usr/local/bin/tailnet-ap install >/dev/null 2>&1 \
         || say "warning: the new program installed but 'install' failed; run it by hand"
     say "updated to $(/usr/local/bin/tailnet-ap version 2>/dev/null || echo "${new_ver:-?}")"
@@ -1271,17 +1400,22 @@ do_doctor() {
     printf "  %-12s %s\n" "country" "$COUNTRY"
     printf "  %-12s %s\n" "ap capable" "${ap:-unknown (needs nmcli)}"
     local routeall adv ap_adv ap_net
-    ap_net=${HOSTIP%.*}.0
+    # The route on adds and off withdraws: the network of HOSTIP/PREFIX, not just a /24.
+    if ap_subnet; then
+        ap_net=$AP_NET
+    else
+        ap_net=$HOSTIP/$PREFIX
+        printf "  %-12s %s\n" "ap subnet" "UNUSABLE: $ap_net (HOSTIP must be a host address in it, PREFIX 8 to 30)"
+    fi
     routeall=$(tailscale debug prefs 2>/dev/null | grep -o '"RouteAll": [a-z]*' | awk '{print $2}')
-    adv=$(tailscale debug prefs 2>/dev/null | python3 -c "import json,sys; d=json.load(sys.stdin); print(','.join(d.get('AdvertiseRoutes') or []))" 2>/dev/null)
-    [ -n "$adv" ] || adv=$(tailscale debug prefs 2>/dev/null | grep -o '"AdvertiseRoutes": \[[^]]*\]' | sed 's/.*\[//; s/\].*//')
+    adv=$(adv_routes)
     printf "  %-12s %s\n" "accept-routes" "${routeall:-unknown}"
     case ",$adv," in
-        *",$ap_net/$PREFIX,"*) printf "  %-12s %s\n" "subnet route" "$ap_net/$PREFIX"; ap_adv=yes ;;
+        *",$ap_net,"*) printf "  %-12s %s\n" "subnet route" "$ap_net"; ap_adv=yes ;;
         *) printf "  %-12s %s\n" "subnet route" "none"; ap_adv=no ;;
     esac
     if [ "${routeall:-}" = false ]; then
-        printf "  %-12s %s\n" "" "this device cannot reach AP clients by ${HOSTIP%.*}.x"
+        printf "  %-12s %s\n" "" "this device cannot reach AP clients in $ap_net"
         printf "  %-12s %s\n" "" "fix: tailscale set --accept-routes"
     fi
     if [ "$ap_adv" = yes ]; then
@@ -1390,6 +1524,10 @@ fi
 # ignored in nmcli, sleep and everything else. This is why the trap sits here and not
 # higher up: the test suite sources this file and must keep its own signal handling.
 trap '' HUP INT TERM
+# One run at a time: a toggle from the Desktop and a second invocation would both move the
+# uplink. The lock is held on fd 9 until this process exits, however it exits.
+exec 9>"$LOCKFILE" || die "cannot open $LOCKFILE"
+flock -n 9 || die "another tailnet-ap is still running (it holds $LOCKFILE). Let it finish, then try again."
     main "$@"
 fi
 TAILNET_AP_LIB_LOADED=yes
