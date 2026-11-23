@@ -55,6 +55,32 @@ Fedora.
   check were written for `10.42.7.0/24`. `ap_subnet` derives them, keeping the
   range inside the subnet and off `HOSTIP`; the defaults give the same drop-in as
   before. `install` and `on` stop on settings that make no usable subnet.
+- **The AP has its own dnsmasq, `tailnet-ap-dnsmasq`, not the system's.** Up to
+  1.1.4 `on` and `off` started and stopped the system-wide `dnsmasq.service` and
+  `install` left `/etc/dnsmasq.d/tailnet-ap.conf`, which a host's own dnsmasq
+  (Pi-hole) reads too, so the AP took over that host's DNS. The unit now runs
+  dnsmasq with its own `-C` config, and its own lease file and pid file, and the
+  old drop-in is removed on install. `clients` reads the new lease file. The
+  config adds `except-interface=lo`: naming an interface makes dnsmasq claim
+  loopback as well, and a host that already holds 127.0.0.1:53 would make this
+  instance fail to bind and leave the AP with no DNS. `install` warns when the
+  system `dnsmasq.service` is enabled or running.
+- **`enable` and `disable`: the AP can come back at boot.** Opt-in. `enable`
+  writes `tailnet-ap-boot.service`, a oneshot that runs `tailnet-ap boot` (which
+  is `on` in mode auto) and refuses, touching nothing, when the AP is already up,
+  then enables it. `disable` stops the AP and takes the enablement away without
+  removing the file. `status` gained an `at boot` line. Nothing starts at boot
+  until `enable` is run, so an existing setup is unchanged.
+- **`uninstall [--purge]`.** Undoes `install` and `enable`: `off` first, then the
+  units, the NetworkManager drop-in, the dnsmasq config and lease file, the sysctl
+  drop-in, the Desktop launcher, the binary, and from the firewalld zone only what
+  `install` recorded adding (noted in `/var/lib/tailnet-ap/firewalld-added`).
+  Anything it did not add is kept and named, with the command to remove it by
+  hand. The Wi-Fi key and the settings file stay unless `--purge`. Only the
+  program's own paths are ever removed; anything else is refused and reported.
+- **`off` removes its firewall rules.** It never did: `fw_remove` was called only
+  from `stop_ap`, which `off` does not call, so iptables and nft kept NAT and
+  FORWARD rules for an `ap0` that no longer existed.
 
 Checked: not yet. `tests/run-tests.sh` does not cover `load_config` or the new
 `install` step; both need a run on a real host before release. The suite has 117

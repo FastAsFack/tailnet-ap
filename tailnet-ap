@@ -2,9 +2,13 @@
 # tailnet-ap - one program for the ThinkPad's wi-fi access point.
 #
 #   tailnet-ap install            lay down the configs and the key (needs root)
+#   tailnet-ap uninstall [--purge]     undo install and enable (--purge: the key and settings too)
 #   tailnet-ap on [--mode cable|wifi]  bring the access point up
 #   tailnet-ap off [--handback]        bring it down
 #   tailnet-ap toggle                  on if it is down, off if it is up
+#   tailnet-ap enable                  bring the access point up at every boot
+#   tailnet-ap disable                 bring it down, and no longer at boot
+#   tailnet-ap boot                    what the boot unit runs: on, unless the AP is already up
 #   tailnet-ap status                  what is running
 #   tailnet-ap clients                 which devices are on the access point
 #   tailnet-ap doctor                  check this machine for what the AP needs
@@ -74,6 +78,18 @@ PSKFILE=/etc/hostapd/tailnet-ap.psk
 NM_CON=tailnet-ap
 UPLINK_CON=tailnet-ap-uplink
 HOSTAPD_UNIT=tailnet-ap-hostapd
+# The AP's own dnsmasq, never the system's dnsmasq.service: install writes this unit and
+# its config, and on, off and stop_ap start and stop only it. The config is not in
+# /etc/dnsmasq.d, which a system dnsmasq (or Pi-hole) on the same host reads too. Its own
+# pid file, and its own lease file (dnsmasq_leases), keep it off the system one's as well.
+DNSMASQ_UNIT=tailnet-ap-dnsmasq
+DNSMASQ_CONF=/etc/tailnet-ap-dnsmasq.conf
+DNSMASQ_PID=/run/tailnet-ap-dnsmasq.pid
+# The boot unit. Only 'tailnet-ap enable' writes it: without enable nothing starts at boot.
+BOOT_UNIT=tailnet-ap-boot
+# What install itself added to the firewalld zone, so uninstall takes away that and no more.
+STATEDIR=/var/lib/tailnet-ap
+FW_ADDED=$STATEDIR/firewalld-added
 NMDIR=/etc/NetworkManager/system-connections
 HOSTAPD_CONF=/etc/hostapd/tailnet-ap.conf
 # The user who owns the desktop. On the ThinkPad that is tijnb, not the admin hermes;
@@ -568,13 +584,38 @@ fw_remove() {
     esac
 }
 
+# fw_item query|add|remove ZONE ITEM: ask whether the permanent firewalld ZONE has ITEM
+# (masquerade, or a service: dhcp or dns), or add it, or remove it.
+fw_item() {
+    if [ "$3" = masquerade ]; then
+        firewall-cmd --permanent --zone="$2" --"$1"-masquerade >/dev/null
+    else
+        firewall-cmd --permanent --zone="$2" --"$1"-service="$3" >/dev/null
+    fi
+}
+
+# fw_added ZONE ITEM: note in $FW_ADDED, once, that install added ITEM to ZONE.
+fw_added() {
+    [ -d "$STATEDIR" ] || install -d -m 755 "$STATEDIR"
+    grep -qxF "$1 $2" "$FW_ADDED" 2>/dev/null || printf '%s %s\n' "$1" "$2" >> "$FW_ADDED"
+}
+
+# dnsmasq_leases: the lease file of the AP's own dnsmasq, apart from the system dnsmasq's.
+# It sits where this distro's dnsmasq keeps its leases (/var/lib/dnsmasq on Fedora,
+# /var/lib/misc on Debian), because SELinux or AppArmor may hold dnsmasq to those places.
+dnsmasq_leases() {
+    if [ -d /var/lib/dnsmasq ]; then echo /var/lib/dnsmasq/tailnet-ap.leases
+    else echo /var/lib/misc/dnsmasq.tailnet-ap.leases
+    fi
+}
+
 stop_ap() {
     # The rules a previous run left name the uplink of its mode, which need not be this
     # run's, so drop them for each interface that can be the uplink.
     fw_remove "$UP_IF"
     [ "$WIFI_IF" = "$UP_IF" ] || fw_remove "$WIFI_IF"
     systemctl stop "$HOSTAPD_UNIT" >/dev/null 2>&1
-    systemctl stop dnsmasq >/dev/null 2>&1
+    systemctl stop "$DNSMASQ_UNIT" >/dev/null 2>&1
     if [ -d "/sys/class/net/$AP_IF" ]; then
         ip link set "$AP_IF" down >/dev/null 2>&1
         ip addr flush dev "$AP_IF" >/dev/null 2>&1
@@ -611,7 +652,7 @@ start_ap_on() {
     systemctl is-active --quiet "$HOSTAPD_UNIT" \
         || die "hostapd would not start on channel $ch (see: journalctl -u $HOSTAPD_UNIT)"
 
-    systemctl start dnsmasq >/dev/null 2>&1
+    systemctl start "$DNSMASQ_UNIT" >/dev/null 2>&1
     sleep 2
     # The clients' internet traffic leaves by the active uplink: the cable in cable mode,
     # the wi-fi in wifi mode. Rules naming $UP_IF in wifi mode masqueraded and forwarded
@@ -787,7 +828,7 @@ if [ "$MODE" = cable ]; then
     say "ap radio    : channel $CH, 20 MHz, no client link sharing it"
     say "gateway/dns : $HOSTIP"
     say "hostapd     : $(systemctl is-active "$HOSTAPD_UNIT")"
-    say "dnsmasq     : $(systemctl is-active dnsmasq)"
+    say "dnsmasq     : $(systemctl is-active "$DNSMASQ_UNIT")"
     say "ap0 addr    : $(ip -4 -br addr show "$AP_IF" 2>/dev/null | awk '{print $3}')"
 else
     # ---------------- wifi mode ----------------
@@ -829,7 +870,7 @@ else
     say "ap radio    : channel $CH, 20 MHz"
     say "gateway/dns : $HOSTIP"
     say "hostapd     : $(systemctl is-active "$HOSTAPD_UNIT")"
-    say "dnsmasq     : $(systemctl is-active dnsmasq)"
+    say "dnsmasq     : $(systemctl is-active "$DNSMASQ_UNIT")"
     say "ap0 addr    : $(ip -4 -br addr show "$AP_IF" 2>/dev/null | awk '{print $3}')"
 fi
 
@@ -860,8 +901,15 @@ say "key         : run 'tailnet-ap key' to show it"
 do_off() {
 parse_off_args "$@"
 
+# The firewall rules on added name the active uplink: the cable in cable mode, the wi-fi
+# in wifi mode. off cannot know which mode on ran in, so, as stop_ap does, it drops them
+# for each interface that can be the uplink. Without this, iptables and nft kept NAT and
+# FORWARD rules for an ap0 that was gone.
+fw_remove "$UP_IF"
+[ "$WIFI_IF" = "$UP_IF" ] || fw_remove "$WIFI_IF"
+
 systemctl stop "$HOSTAPD_UNIT" >/dev/null 2>&1 && echo "hostapd stopped"
-systemctl stop dnsmasq >/dev/null 2>&1 && echo "dnsmasq stopped"
+systemctl stop "$DNSMASQ_UNIT" >/dev/null 2>&1 && echo "dnsmasq stopped"
 
 if [ -d "/sys/class/net/$AP_IF" ]; then
     ip addr flush dev "$AP_IF" >/dev/null 2>&1
@@ -954,6 +1002,70 @@ do_toggle() {
     fi
 }
 
+# ---------------- boot ----------------
+# Opt-in: no boot unit exists, and nothing starts at boot, until 'tailnet-ap enable'.
+# Enabling the hostapd unit alone would not do: ap0 only exists once 'on' has built it.
+
+# do_boot: what the boot unit runs, 'on' with its defaults (mode auto). An AP that is
+# already up, because a Desktop toggle got there first, is left alone and the unit fails
+# with the reason, instead of tearing it down and starting it again. A toggle that is
+# still running holds the run lock, and then the boot unit stops before it gets here.
+do_boot() {
+    ap_is_up && die "the access point is already up, so the boot unit leaves it alone"
+    do_on
+}
+
+# do_enable: write the boot unit and enable it. It does not start the AP now.
+do_enable() {
+    [ -x /usr/local/bin/tailnet-ap ] && grep -q '^do_boot() {$' /usr/local/bin/tailnet-ap \
+        || die "the boot unit runs /usr/local/bin/tailnet-ap boot, which is missing or too old: run 'sudo tailnet-ap install' first"
+    [ -r "/etc/systemd/system/$HOSTAPD_UNIT.service" ] && [ -r "/etc/systemd/system/$DNSMASQ_UNIT.service" ] \
+        || die "the AP's units are not installed: run 'sudo tailnet-ap install' first"
+    [ -s "$PSKFILE" ] || die "no key at $PSKFILE: run 'sudo tailnet-ap install' first"
+    cat > "/etc/systemd/system/$BOOT_UNIT.service" <<CONF
+[Unit]
+Description=tailnet AP ($SSID) at boot, from 'tailnet-ap enable'
+# on picks cable or wifi from the links that are up and advertises the AP subnet through
+# tailscale, so it waits for the network and for tailscaled.
+Wants=network-online.target
+After=network-online.target NetworkManager.service tailscaled.service
+
+[Service]
+Type=oneshot
+# boot is on, except that it fails, touching nothing, when the AP is already up.
+ExecStart=/usr/local/bin/tailnet-ap boot
+
+[Install]
+WantedBy=multi-user.target
+CONF
+    chmod 644 "/etc/systemd/system/$BOOT_UNIT.service"
+    systemctl daemon-reload
+    systemctl enable "$BOOT_UNIT" >/dev/null 2>&1 || die "could not enable $BOOT_UNIT"
+    say "enable: the access point comes up at every boot"
+    say "  /etc/systemd/system/$BOOT_UNIT.service written"
+    say "  $BOOT_UNIT enabled, wanted by multi-user.target"
+    say "  at boot it runs 'tailnet-ap boot', which is 'on' in mode auto: ap0, hostapd"
+    say "  ($HOSTAPD_UNIT), dnsmasq ($DNSMASQ_UNIT), the firewall rules and the route"
+    say "  the AP is not started now; 'tailnet-ap on' does that. Undo: tailnet-ap disable"
+}
+
+# do_disable: take the boot enablement away and stop the AP. The boot unit file stays,
+# inert, so 'enable' can turn it back on; uninstall removes it. Nothing else is touched.
+do_disable() {
+    say "disable: the access point at boot"
+    if systemctl is-enabled --quiet "$BOOT_UNIT" 2>/dev/null; then
+        if systemctl disable "$BOOT_UNIT" >/dev/null 2>&1; then
+            say "  $BOOT_UNIT disabled: the AP no longer comes up at boot"
+        else
+            say "  WARNING: could not disable $BOOT_UNIT"
+        fi
+    else
+        say "  $BOOT_UNIT was not enabled"
+    fi
+    say "disable: stopping the access point"
+    do_off
+}
+
 # ---------------- install ----------------
 # Lays down what the access point needs on disk. Mirrors the tested deploy.sh:
 # the same four drop-ins, the same firewall changes, the same key handling.
@@ -976,11 +1088,20 @@ do_install() {
     desktop="$userhome/Desktop"
 
     say "install: static pieces"
-    install -d -m 755 /etc/dnsmasq.d /etc/hostapd
+    install -d -m 755 /etc/hostapd
 
     # A distro hostapd unit that is already running will fight ours for the radio.
     if systemctl is-active --quiet hostapd 2>/dev/null; then
         say "  WARNING: the system's hostapd.service is running; stop it to avoid a conflict"
+    fi
+    # The AP's dnsmasq is its own instance and needs port 53 on ap0. The system's
+    # dnsmasq.service, which Debian enables with the package and which served the AP up to
+    # 1.1.4, listens on every interface unless told otherwise, and then holds that port.
+    if systemctl is-enabled --quiet dnsmasq 2>/dev/null || systemctl is-active --quiet dnsmasq 2>/dev/null; then
+        say "  WARNING: the system's dnsmasq.service is enabled or running. Unless it is set to"
+        say "           leave $AP_IF alone (bind-interfaces, except-interface=$AP_IF), it holds"
+        say "           port 53 there and $DNSMASQ_UNIT cannot start. If only the AP used it:"
+        say "           systemctl disable --now dnsmasq"
     fi
 
     if command -v nmcli >/dev/null 2>&1; then
@@ -994,10 +1115,15 @@ CONF
         say "  no NetworkManager: skipping the ap0 unmanaged rule"
     fi
 
-    cat > /etc/dnsmasq.d/tailnet-ap.conf <<CONF
+    cat > "$DNSMASQ_CONF" <<CONF
 # DHCP and DNS for clients on the virtual AP interface ap0.
 interface=ap0
 bind-dynamic
+# Naming an interface makes dnsmasq claim loopback too, and a host that already runs its
+# own dnsmasq (Pi-hole, libvirt) holds 127.0.0.1:53, so this instance would fail to bind
+# and the AP would come up with no DNS. libvirt's dnsmasq excludes loopback the same way.
+# The AP's clients query the AP's own address, never loopback.
+except-interface=lo
 dhcp-range=$AP_DHCP_FIRST,$AP_DHCP_LAST,$AP_MASK,12h
 dhcp-option=option:router,$HOSTIP
 dhcp-option=option:dns-server,$HOSTIP
@@ -1014,7 +1140,13 @@ filter-AAAA
 CONF
     # The host shortcut is optional: with HOSTRECORD empty there is no host-record line.
     if [ -n "$HOSTRECORD" ]; then
-        echo "host-record=$HOSTRECORD" >> /etc/dnsmasq.d/tailnet-ap.conf
+        echo "host-record=$HOSTRECORD" >> "$DNSMASQ_CONF"
+    fi
+    # Up to 1.1.4 this config was /etc/dnsmasq.d/tailnet-ap.conf, which the system's
+    # dnsmasq (and Pi-hole) read too, so on a host that runs one it took over its DNS.
+    if [ -e /etc/dnsmasq.d/tailnet-ap.conf ]; then
+        rm -f /etc/dnsmasq.d/tailnet-ap.conf
+        say "  removed the old /etc/dnsmasq.d/tailnet-ap.conf: the AP's dnsmasq reads $DNSMASQ_CONF"
     fi
 
     local hostapd_bin
@@ -1033,13 +1165,33 @@ Restart=no
 WantedBy=multi-user.target
 CONF
 
+    local dnsmasq_bin leases
+    dnsmasq_bin=$(command -v dnsmasq || echo /usr/sbin/dnsmasq)
+    leases=$(dnsmasq_leases)
+    cat > /etc/systemd/system/tailnet-ap-dnsmasq.service <<CONF
+[Unit]
+Description=dnsmasq for the tailnet AP ($SSID), on $AP_IF only
+After=network.target
+
+[Service]
+Type=simple
+# Its own config (-C), so it never reads /etc/dnsmasq.conf or /etc/dnsmasq.d, and its own
+# lease file (-l) and pid file (-x), so it never writes over the system dnsmasq's.
+ExecStart=$dnsmasq_bin -k -C $DNSMASQ_CONF -l $leases -x $DNSMASQ_PID
+Restart=no
+
+[Install]
+WantedBy=multi-user.target
+CONF
+
     cat > /etc/sysctl.d/60-tailnet-ap.conf <<CONF
 # Tailnet AP: let clients on $AP_NET be routed to the tailnet and out.
 net.ipv4.ip_forward = 1
 CONF
 
-    chmod 644 /etc/dnsmasq.d/tailnet-ap.conf \
+    chmod 644 "$DNSMASQ_CONF" \
               /etc/systemd/system/tailnet-ap-hostapd.service \
+              /etc/systemd/system/tailnet-ap-dnsmasq.service \
               /etc/sysctl.d/60-tailnet-ap.conf
     [ -f /etc/NetworkManager/conf.d/99-tailnet-ap.conf ] \
         && chmod 644 /etc/NetworkManager/conf.d/99-tailnet-ap.conf
@@ -1060,11 +1212,14 @@ CONF
             # zone's forward chain has no rule for the tailnet interface and drops every
             # packet from the AP into the tailnet. Measured 21 Nov 2026: phone -> peer failed.
             firewall-cmd --permanent --zone="$zone" --add-interface=tailscale0 >/dev/null
-            firewall-cmd --permanent --zone="$zone" --add-masquerade >/dev/null
+            # masquerade, dhcp and dns are added only when the zone lacks them, and each one
+            # added is noted in $FW_ADDED: uninstall removes those and nothing a human added.
             # Without dhcp and dns the AP looks healthy and cannot work: clients associate,
             # authenticate, then get no address because udp 67/68 is dropped before dnsmasq.
-            firewall-cmd --permanent --zone="$zone" --add-service=dhcp >/dev/null
-            firewall-cmd --permanent --zone="$zone" --add-service=dns >/dev/null
+            for _item in masquerade dhcp dns; do
+                fw_item query "$zone" "$_item" && continue
+                fw_item add "$zone" "$_item" && fw_added "$zone" "$_item"
+            done
             firewall-cmd --reload >/dev/null
 
             # Prove it landed instead of trusting the warnings. A silent ALREADY_ENABLED
@@ -1154,12 +1309,170 @@ CONF
     echo
     say "verification"
     printf "  ip_forward        : %s\n" "$(sysctl -n net.ipv4.ip_forward)"
-    printf "  dnsmasq drop-in   : %s\n" "$( [ -r /etc/dnsmasq.d/tailnet-ap.conf ] && echo present || echo MISSING)"
+    printf "  dnsmasq config    : %s\n" "$( [ -r "$DNSMASQ_CONF" ] && echo present || echo MISSING)"
+    printf "  dnsmasq unit      : %s\n" "$( [ -r /etc/systemd/system/tailnet-ap-dnsmasq.service ] && echo present || echo MISSING)"
     printf "  hostapd unit      : %s\n" "$( [ -r /etc/systemd/system/tailnet-ap-hostapd.service ] && echo present || echo MISSING)"
     printf "  program           : %s\n" "$( [ -x /usr/local/bin/tailnet-ap ] && echo /usr/local/bin/tailnet-ap || echo MISSING)"
     printf "  launcher          : %s\n" "$( [ -x "$desktop/tailnet-ap.desktop" ] && echo present || echo MISSING)"
     printf "  key               : %s characters\n" "$(wc -c < "$PSKFILE")"
     printf "  firewall          : %s\n" "$(fw_backend)"
+}
+
+# ---------------- uninstall ----------------
+# launcher_path: where install puts the Desktop launcher for $DESKTOP_USER, or nothing
+# when that user has no home directory.
+launcher_path() {
+    local home
+    home=$(getent passwd "$DESKTOP_USER" 2>/dev/null | cut -d: -f6)
+    [ -n "$home" ] && printf '%s\n' "$home/Desktop/tailnet-ap.desktop"
+}
+
+# own_path PATH: succeeds only for a path tailnet-ap itself writes, or the directory it
+# keeps its state in. uninstall removes nothing else.
+own_path() {
+    [ -n "${1:-}" ] || return 1
+    case "$1" in
+        "/etc/systemd/system/$BOOT_UNIT.service"|"/etc/systemd/system/$HOSTAPD_UNIT.service"|\
+        "/etc/systemd/system/$DNSMASQ_UNIT.service"|/etc/NetworkManager/conf.d/99-tailnet-ap.conf|\
+        "$DNSMASQ_CONF"|/etc/dnsmasq.d/tailnet-ap.conf|"$(dnsmasq_leases)"|"$DNSMASQ_PID"|\
+        "$HOSTAPD_CONF"|/etc/sysctl.d/60-tailnet-ap.conf|"$PSKFILE"|"$CONFFILE"|\
+        "$FW_ADDED"|"$STATEDIR"|/usr/local/bin/tailnet-ap|/usr/local/bin/tailnet-ap.bak|\
+        "$LOCKFILE")
+            return 0 ;;
+    esac
+    [ "$1" = "$(launcher_path)" ]
+}
+
+# remove_own PATH: remove PATH and say so, when own_path allows it and it is there. A
+# directory goes only when it is empty. Any other path is refused and left alone.
+remove_own() {
+    if ! own_path "$1"; then
+        say "  REFUSED: $1 is not one of tailnet-ap's own paths, so it stays"
+        return 1
+    fi
+    if [ -d "$1" ] && [ ! -L "$1" ]; then
+        if rmdir -- "$1" 2>/dev/null; then say "  removed $1"
+        else say "  kept $1: it holds files tailnet-ap did not write"; fi
+    elif [ -e "$1" ] || [ -L "$1" ]; then
+        if rm -f -- "$1"; then say "  removed $1"
+        else say "  WARNING: could not remove $1"; fi
+    fi
+}
+
+# do_uninstall [--purge]: undo install, and enable if it was used. off runs first, so the
+# AP, its firewall rules and its route are gone before the files are. Each path or change
+# is printed as it is undone. The Wi-Fi key and the settings stay unless --purge.
+do_uninstall() {
+    local purge=no u z item launcher
+    case "${1:-}" in
+        "")      ;;
+        --purge) purge=yes ;;
+        *)       die "usage: tailnet-ap uninstall [--purge]" ;;
+    esac
+    [ "$(id -u)" -eq 0 ] || die "uninstall needs root: sudo tailnet-ap uninstall"
+
+    say "uninstall: bringing the AP down first"
+    do_off
+
+    say "uninstall: what install and enable put down"
+    if systemctl is-enabled --quiet "$BOOT_UNIT" 2>/dev/null \
+        && systemctl disable "$BOOT_UNIT" >/dev/null 2>&1; then
+        say "  $BOOT_UNIT disabled: the AP no longer comes up at boot"
+    fi
+    remove_own "/etc/systemd/system/$BOOT_UNIT.service"
+    for u in "$HOSTAPD_UNIT" "$DNSMASQ_UNIT"; do
+        if systemctl is-enabled --quiet "$u" 2>/dev/null \
+            && systemctl disable "$u" >/dev/null 2>&1; then
+            say "  $u disabled"
+        fi
+        remove_own "/etc/systemd/system/$u.service"
+    done
+    systemctl daemon-reload >/dev/null 2>&1
+    systemctl reset-failed "$BOOT_UNIT" "$HOSTAPD_UNIT" "$DNSMASQ_UNIT" >/dev/null 2>&1
+    say "  systemd reloaded"
+    if [ -e /etc/NetworkManager/conf.d/99-tailnet-ap.conf ]; then
+        remove_own /etc/NetworkManager/conf.d/99-tailnet-ap.conf
+        nmcli general reload >/dev/null 2>&1 && say "  NetworkManager reloaded"
+    fi
+    remove_own "$DNSMASQ_CONF"
+    remove_own /etc/dnsmasq.d/tailnet-ap.conf
+    remove_own "$(dnsmasq_leases)"
+    remove_own "$DNSMASQ_PID"
+    remove_own "$HOSTAPD_CONF"
+    if [ -e /etc/sysctl.d/60-tailnet-ap.conf ]; then
+        remove_own /etc/sysctl.d/60-tailnet-ap.conf
+        say "  ip_forward stays as it is now; from the next boot the other sysctl files decide"
+    fi
+    launcher=$(launcher_path)
+    [ -n "$launcher" ] && remove_own "$launcher"
+    # The 2.4 GHz copy that --move-uplink made. Deleted only when it is not the live link,
+    # by the same guard restore_uplink uses: deleting the live uplink is the lockout.
+    if nmcli -t -f NAME con show 2>/dev/null | grep -qx "$UPLINK_CON"; then
+        if copy_not_live && nmcli con delete "$UPLINK_CON" >/dev/null 2>&1; then
+            say "  removed the NetworkManager profile $UPLINK_CON (the 2.4 GHz uplink copy)"
+        else
+            say "  kept the NetworkManager profile $UPLINK_CON: it may be the live link."
+            say "  Once the wi-fi is on its normal profile:  nmcli con delete $UPLINK_CON"
+        fi
+    fi
+
+    say "uninstall: firewall ($(fw_backend))"
+    case "$(fw_backend)" in
+        firewalld)
+            for item in "$AP_IF" tailscale0; do
+                z=$(firewall-cmd --permanent --get-zone-of-interface="$item" 2>/dev/null)
+                [ -n "$z" ] && [ "$z" != "no zone" ] || continue
+                if firewall-cmd --permanent --zone="$z" --remove-interface="$item" >/dev/null; then
+                    say "  removed $item from the $z zone"
+                fi
+            done
+            # masquerade, dhcp and dns: only what install noted adding. What the zone had
+            # before, a human's or an install's from before the note existed, stays.
+            if [ -r "$FW_ADDED" ]; then
+                while read -r z item <&3; do
+                    case "$item" in masquerade|dhcp|dns) ;; *) continue ;; esac
+                    if fw_item query "$z" "$item" && fw_item remove "$z" "$item"; then
+                        say "  removed $item from the $z zone (install added it)"
+                    fi
+                done 3< "$FW_ADDED"
+            fi
+            z=$(fw_zone)
+            local kept=''
+            for item in masquerade dhcp dns; do
+                grep -qxF "$z $item" "$FW_ADDED" 2>/dev/null && continue
+                fw_item query "$z" "$item" \
+                    && { say "  kept $item in the $z zone: tailnet-ap did not add it"; kept="$kept $item"; }
+            done
+            # A host installed before the record existed has no note of what install added,
+            # so its masquerade, dhcp and dns stay. Say how to take them off by hand.
+            if [ -n "$kept" ]; then
+                say "  to remove one by hand, e.g.:  firewall-cmd --permanent --zone=$z --remove-service=dhcp"
+                say "  (masquerade takes --remove-masquerade), then:  firewall-cmd --reload"
+            fi
+            firewall-cmd --reload >/dev/null && say "  firewalld reloaded"
+            ;;
+        iptables|nftables)
+            say "  the AP's rules went with 'off' above; there is nothing else to remove"
+            ;;
+    esac
+
+    say "uninstall: the Wi-Fi key and the settings"
+    if [ "$purge" = yes ]; then
+        remove_own "$PSKFILE"
+        remove_own "$CONFFILE"
+    else
+        [ -e "$PSKFILE" ] && say "  kept $PSKFILE, the Wi-Fi key: a later install uses it again"
+        [ -e "$CONFFILE" ] && say "  kept $CONFFILE, the settings"
+        say "  --purge removes both; or later:  sudo rm $PSKFILE $CONFFILE"
+    fi
+
+    say "uninstall: the program"
+    remove_own /usr/local/bin/tailnet-ap
+    remove_own /usr/local/bin/tailnet-ap.bak
+    remove_own "$FW_ADDED"
+    remove_own "$STATEDIR"
+    remove_own "$LOCKFILE"
+    say "tailnet-ap is uninstalled."
 }
 
 # ---------------- version / update ----------------
@@ -1320,6 +1633,15 @@ svc_state() {
     printf '%s' "${s:-unknown}"
 }
 
+# boot_state: enabled when 'tailnet-ap enable' has the AP come up at boot, else disabled.
+boot_state() {
+    if systemctl is-enabled --quiet "$BOOT_UNIT" 2>/dev/null; then
+        printf 'enabled (%s)' "$BOOT_UNIT"
+    else
+        printf 'disabled'
+    fi
+}
+
 do_status() {
     local up=no ap_addr uplink
     ap_is_up && up=yes
@@ -1327,8 +1649,9 @@ do_status() {
     uplink=$(nmcli -t -f DEVICE,STATE,CONNECTION dev status 2>/dev/null \
              | awk -F: '$2=="connected"{print $1" ("$3")"}' | paste -sd', ' -)
     printf "%-20s %s\n" "access point" "$up"
+    printf "%-20s %s\n" "at boot" "$(boot_state)"
     printf "%-20s %s\n" "hostapd" "$(svc_state "$HOSTAPD_UNIT")"
-    printf "%-20s %s\n" "dnsmasq" "$(svc_state dnsmasq)"
+    printf "%-20s %s\n" "dnsmasq" "$(svc_state "$DNSMASQ_UNIT")"
     printf "%-20s %s\n" "ap0" "${ap_addr:-none}"
     printf "%-20s %s\n" "ssid" "$SSID"
     printf "%-20s %s\n" "uplink" "${uplink:-none}"
@@ -1344,8 +1667,8 @@ do_clients() {
         say "the access point is not running"
         return 0
     fi
-    local leases=/var/lib/misc/dnsmasq.leases count
-    [ -f "$leases" ] || leases=/var/lib/dnsmasq/dnsmasq.leases
+    local leases count
+    leases=$(dnsmasq_leases)
     count=$(iw dev "$AP_IF" station dump 2>/dev/null | grep -c '^Station' || true)
     say "clients on $SSID ($AP_IF)"
     if [ "${count:-0}" -eq 0 ]; then
@@ -1485,9 +1808,13 @@ main() {
     [ "$#" -gt 0 ] && shift
     case "$cmd" in
         install)              do_install ;;
+        uninstall)            do_uninstall "$@" ;;
         on)                   do_on "$@" ;;
         off)                  do_off "$@" ;;
         toggle)               do_toggle ;;
+        enable)               do_enable ;;
+        disable)              do_disable ;;
+        boot)                 do_boot ;;
         status)               do_status ;;
         clients)              do_clients ;;
         doctor)               do_doctor ;;
@@ -1511,7 +1838,7 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
             case "${2:-}" in
                 --check|--test) main "$@"; exit 0 ;;
             esac ;;
-        install|on|off|toggle|key|clients|update) ;;
+        install|uninstall|on|off|toggle|enable|disable|boot|key|clients|update) ;;
         *) die "unknown command: ${1:-} (try: tailnet-ap help)" ;;
     esac
 # ---- root, via pkexec when launched from the desktop ----
