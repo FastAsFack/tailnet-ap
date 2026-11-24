@@ -7,7 +7,14 @@ changed, and how it was checked. The program prints its own version with
 Versions are `MAJOR.MINOR.PATCH`. `1.1.0` is the first release that runs outside
 Fedora.
 
-## Unreleased
+## 1.2.0 - 2026-11-23
+
+The release for hosts that are not the author's. The settings live in a file
+that reaches the Desktop launcher; wifi mode reaches the internet on iptables and
+nft hosts; `on` and `off` keep the routes a host already advertises; one run at a
+time; the AP has its own dnsmasq instead of the system's; it can come up at boot
+and be uninstalled; `update` installs only a release tag, checked against its
+`SHA256SUMS`; and `doctor` gives a verdict in its exit status.
 
 - **One settings file, `/etc/tailnet-ap.conf`.** Plain `KEY=value` lines, `644`,
   root-owned, no secret (the key stays in `/etc/hostapd/tailnet-ap.psk`). It holds
@@ -81,13 +88,74 @@ Fedora.
 - **`off` removes its firewall rules.** It never did: `fw_remove` was called only
   from `stop_ap`, which `off` does not call, so iptables and nft kept NAT and
   FORWARD rules for an `ap0` that no longer existed.
+- **`update` installs a release tag, never the head of `main`.** Up to 1.1.4 it
+  downloaded the head of `main`, checked only `bash -n`, and ran the new file's
+  `install` as root, so any push to `main` ran as root on every host that
+  updated. It now reads the tags from the GitHub API, takes the highest
+  `vMAJOR.MINOR.PATCH` by `sort -V` (`newest_tag`), and downloads `tailnet-ap`
+  pinned to it (`contents/tailnet-ap?ref=<tag>`). No release tag at all is a
+  clear stop. The no-downgrade rule is unchanged and now lives in
+  `update_verdict`, a pure function. `--check` still changes nothing and now
+  names the tag; `--test` is unchanged; the run lock is still let go before the
+  nested `install`. `REPO_RAW`, the `?ref=main` fallback, is gone. Only the first
+  100 tags the API lists are read.
+- **`update` checks `SHA256SUMS`.** When the tag holds a `SHA256SUMS` file, the
+  download's sha256 must match its `tailnet-ap` line (`sum_for`), or `update`
+  refuses and installs nothing; a file with no such line counts as a mismatch. A
+  tag without one is named in one line and the update goes on. Whether the tag
+  has one is read from the tag's file list, not guessed from a failed download.
+  Still `curl` or `wget` plus `python3`, which `update` now needs outright. The
+  checksum comes from the same repository as the file, so it catches a corrupt or
+  mismatched download, not a compromised repository: a signed checksum is a
+  possible follow-up. A release is cut with `sha256sum tailnet-ap > SHA256SUMS`,
+  committed, then tagged.
+- **`doctor` exits 1 when the AP cannot work here**: `hostapd`, `dnsmasq` or `iw`
+  missing, no radio shown to be AP-capable (`ap_radio`: nmcli's
+  `WIFI-PROPERTIES.AP` as before, then the phy's supported interface modes in
+  `iw`), or `HOSTIP` and `PREFIX` that make no usable subnet. Otherwise 0. It ends
+  with a `result` line naming what failed. The dispatcher now passes the status
+  of `help`, `status`, `doctor` and `version` on; it used to `exit 0` after them.
+- **`doctor` says "approve the subnet route" only when the route is advertised
+  and not approved.** It said so whenever the route was advertised. Advertised is
+  not approved, and neither is `PrimaryRoutes` in `tailscale status --json`.
+  `route_approval` reads `tailscale debug netmap` and calls the route approved
+  when a rule in its `PacketFilter` has the AP subnet as a source. When the
+  netmap cannot be read (it may need root, and it needs `python3`), or a rule
+  takes every source, `doctor` says it cannot tell instead of guessing. A route
+  list that cannot be read is now `unknown`, not `none`.
+- **`doctor` checks that tailscale is logged in and running** (`BackendState` in
+  `tailscale status --json`, `ts_backend`), **and that nothing else holds port 53
+  for `HOSTIP`** (`ss -lunp` and `ss -ltnp`, `port53_holders`), on that address
+  or a wildcard; the AP's own dnsmasq, by its pid file, is not counted. Both are
+  warnings and do not change the exit status.
+- **`help`** names `--move-uplink`, what it is for and where it goes, `doctor`'s
+  exit status, and the tag-based `update`.
+- **README**: `--move-uplink`, `enable`, `disable`, `uninstall`, the Pi 3B (not
+  only the 3B+), the new `update`, the test count, and the licence.
+- **`LICENSE`**: MIT, copyright 2026 FastAsFack.
 
-Checked: not yet. `tests/run-tests.sh` does not cover `load_config` or the new
-`install` step; both need a run on a real host before release. The suite has 117
-checks now: the new one runs `start_ap_on` in wifi mode against a stubbed
-iptables and checks that the masquerade and FORWARD rules name `wlp3s0`. The
-route handling, the lock and `ap_subnet` are not in the suite and need the same
-real-host run.
+Checked: `bash tests/run-tests.sh` has 200 checks, all offline. It sources the
+program (`lib/tailnet-ap-lib.sh` is a symlink to `tailnet-ap`). Added in this
+release: `start_ap_on` in wifi mode naming `wlp3s0` in the masquerade and
+FORWARD rules; `adv_routes` on a list on one line, over several lines, `null`,
+`[]`, a failing tailscale and a list cut off mid-way (the last two must fail,
+not read as empty), each with and without `python3`; `routes_with` and
+`routes_without`; `update_verdict`, `newest_tag` and `sum_for`; `do_update`
+against a stubbed GitHub (no tags, a matching, missing and wrong `SHA256SUMS`, an
+older file, the same file); `iw_has_ap`, `route_approval` and `port53_holders`;
+and `do_doctor`'s exit status and messages on a stubbed machine.
+
+Not checked yet. None of this release is recorded as run on a real host:
+`load_config` and the settings step of `install`; the run lock; `ap_subnet`,
+which is not in the suite, with anything but the defaults; `on` and `off`
+changing the advertised routes on a live tailnet; the private dnsmasq; `enable`,
+`disable`, `boot` and `uninstall`; `update` against the real GitHub API, where no
+tag holds a `SHA256SUMS` yet, so the first one that does is the first real test
+of the check; whether a real netmap's `PacketFilter` carries the AP subnet once
+the route is approved, which `route_approval` relies on; and `ap_radio`'s `iw`
+fallback on a host without nmcli. `route_approval`'s parsing is checked only
+where the host running the suite has `python3`; without it the suite checks that
+it says `unknown`.
 
 ## 1.1.4 - 2026-11-21
 
@@ -262,10 +330,11 @@ while the Pi kept serving nginx, SSH and its tailnet address.
 
 ### Tests
 
-`bash tests/run-tests.sh` runs 116 checks on `lib/tailnet-ap-lib.sh` and the
-functions extracted from `tailnet-ap-on.sh`, which is the code the single file
-was merged from. It does **not** source the merged file, so `update` and
-`doctor` are not covered by the suite. Those were exercised by hand on the Pi:
+`bash tests/run-tests.sh` runs 116 checks. It sources the merged file:
+`lib/tailnet-ap-lib.sh` and `tailnet-ap-on.sh` are symlinks to `tailnet-ap`, so
+the functions it extracts from `tailnet-ap-on.sh` come from the merged file too.
+It has no checks for `update` or `doctor`, so those are not covered by the
+suite. Those were exercised by hand on the Pi:
 `version`, `update --check`, a deliberately modified installed copy updated back
 to the released file, and `doctor` showing `accept-routes` and the AP subnet.
 The Pi was also the integration test: hostapd, dnsmasq, DHCP, DNS, NAT to the

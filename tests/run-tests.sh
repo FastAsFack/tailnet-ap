@@ -617,6 +617,305 @@ same "wifi mode: client traffic is masqueraded and forwarded out of wlp3s0, not 
 -I FORWARD -i wlp3s0 -o ap0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT" \
     "$(ap_rules wifi)"
 
+# ---- the advertised routes ----
+section "adv_routes, routes_with, routes_without: the routes on adds to and off takes from"
+# "tailscale debug prefs" as it prints the list: on one line, over several, null, empty,
+# and cut off in the middle
+PREFS_ONE=$'{\n\t"ControlURL": "https://controlplane.tailscale.com",\n\t"RouteAll": true,\n\t"AdvertiseRoutes": ["0.0.0.0/0", "10.42.7.0/24"],\n\t"WantRunning": true\n}'
+PREFS_MULTI=$'{\n\t"RouteAll": true,\n\t"AdvertiseRoutes": [\n\t\t"0.0.0.0/0",\n\t\t"::/0",\n\t\t"10.42.7.0/24"\n\t],\n\t"WantRunning": true\n}'
+PREFS_NULL=$'{\n\t"RouteAll": true,\n\t"AdvertiseRoutes": null,\n\t"WantRunning": true\n}'
+PREFS_EMPTY=$'{\n\t"RouteAll": true,\n\t"AdvertiseRoutes": [],\n\t"WantRunning": true\n}'
+PREFS_CUT=$'{\n\t"RouteAll": true,\n\t"AdvertiseRoutes": [\n\t\t"0.0.0.0/0",\n\t\t"10.42.7.0/24",'
+PREFS_AP=$'{\n\t"RouteAll": true,\n\t"AdvertiseRoutes": [\n\t\t"10.42.7.0/24"\n\t],\n\t"WantRunning": true\n}'
+# routes_read PREFS [nopython]: run adv_routes in a subshell with "tailscale debug prefs"
+# printing PREFS, or failing with no output when PREFS is FAIL. nopython hides python3 from
+# command -v, so the awk reader runs whatever the host has. Prints "rc=STATUS [ROUTES]".
+routes_read() {
+    ( FX_PREFS=$1
+      tailscale() {
+          [ "$*" = "debug prefs" ] || { refused tailscale "$@"; return; }
+          [ "$FX_PREFS" != FAIL ] || return 1
+          printf '%s\n' "$FX_PREFS"
+      }
+      if [ "${2:-}" = nopython ]; then
+          command() {
+              if [ "${1:-}" = -v ] && [ "${2:-}" = python3 ]; then return 1; fi
+              builtin command "$@"
+          }
+      fi
+      r=$(adv_routes); printf 'rc=%s [%s]' "$?" "$r" )
+}
+for how in default nopython; do
+    if [ "$how" = default ]; then by=adv_routes; else by="adv_routes without python3"; fi
+    same "$by: a list on one line" "rc=0 [0.0.0.0/0,10.42.7.0/24]" "$(routes_read "$PREFS_ONE" "$how")"
+    same "$by: a list over several lines" "rc=0 [0.0.0.0/0,::/0,10.42.7.0/24]" "$(routes_read "$PREFS_MULTI" "$how")"
+    same "$by: null, an empty list" "rc=0 []" "$(routes_read "$PREFS_NULL" "$how")"
+    same "$by: [], an empty list" "rc=0 []" "$(routes_read "$PREFS_EMPTY" "$how")"
+    same "$by: tailscale fails: a failure, not an empty list" "rc=1 []" "$(routes_read FAIL "$how")"
+    same "$by: cut off mid-list: a failure, not an empty list" "rc=1 []" "$(routes_read "$PREFS_CUT" "$how")"
+done
+same "routes_with: an empty list gets the AP subnet alone" \
+    "10.42.7.0/24" "$(routes_with "" 10.42.7.0/24)"
+same "routes_with: added at the end, the others kept in order" \
+    "0.0.0.0/0,::/0,10.42.7.0/24" "$(routes_with "0.0.0.0/0,::/0" 10.42.7.0/24)"
+same "routes_with: already in the list, not added twice" \
+    "0.0.0.0/0,10.42.7.0/24,::/0" "$(routes_with "0.0.0.0/0,10.42.7.0/24,::/0" 10.42.7.0/24)"
+same "routes_with: 110.42.7.0/24 is another route, not the AP subnet" \
+    "110.42.7.0/24,10.42.7.0/24" "$(routes_with "110.42.7.0/24" 10.42.7.0/24)"
+same "routes_without: the AP subnet out of the middle, the rest in order" \
+    "0.0.0.0/0,::/0" "$(routes_without "0.0.0.0/0,10.42.7.0/24,::/0" 10.42.7.0/24)"
+same "routes_without: the AP subnet alone leaves an empty list" \
+    "" "$(routes_without "10.42.7.0/24" 10.42.7.0/24)"
+same "routes_without: an empty list stays empty" \
+    "" "$(routes_without "" 10.42.7.0/24)"
+same "routes_without: 110.42.7.0/24 is another route and stays" \
+    "110.42.7.0/24,192.168.1.0/24" "$(routes_without "110.42.7.0/24,192.168.1.0/24" 10.42.7.0/24)"
+same "on then off gives back the list as it was" \
+    "0.0.0.0/0,::/0" "$(routes_without "$(routes_with "0.0.0.0/0,::/0" 10.42.7.0/24)" 10.42.7.0/24)"
+
+# ---- update, the pure parts ----
+section "update: the no-downgrade rule, the newest tag, the SHA256SUMS line"
+same "update_verdict: 1.2.0 installed, 1.2.1 offered: install" install "$(update_verdict 1.2.0 1.2.1 aaa bbb)"
+same "update_verdict: 1.9.0 installed, 1.10.0 offered: install (sort -V, not text order)" \
+    install "$(update_verdict 1.9.0 1.10.0 aaa bbb)"
+same "update_verdict: 1.2.0 installed, 1.1.4 offered: older, never installed" \
+    older "$(update_verdict 1.2.0 1.1.4 aaa bbb)"
+same "update_verdict: 1.10.0 installed, 1.9.9 offered: older (text order would say newer)" \
+    older "$(update_verdict 1.10.0 1.9.9 aaa bbb)"
+same "update_verdict: the same file: same" same "$(update_verdict 1.2.0 1.2.0 aaa aaa)"
+same "update_verdict: the same version, another file: install, as before" \
+    install "$(update_verdict 1.2.0 1.2.0 aaa bbb)"
+same "update_verdict: no VERSION in the download: noversion" noversion "$(update_verdict 1.2.0 "" aaa bbb)"
+# tag_of NAMES: what newest_tag makes of NAMES, one per line, as "rc=STATUS [TAG]"
+tag_of() { local r; r=$(printf '%s\n' "$1" | newest_tag); printf 'rc=%s [%s]' "$?" "$r"; }
+same "newest_tag: the highest by sort -V" "rc=0 [v1.10.0]" \
+    "$(tag_of $'v1.1.0\nv1.1.4\nv1.9.2\nv1.10.0\nv1.2.0')"
+same "newest_tag: only vMAJOR.MINOR.PATCH counts" "rc=0 [v1.2.0]" \
+    "$(tag_of $'v2.0.0-rc1\nlatest\n1.3.0\nv1.3\nv1.2.0\nv1.1.4')"
+same "newest_tag: no tags at all: fails" "rc=1 []" "$(tag_of "")"
+same "newest_tag: no tag of that form: fails" "rc=1 []" "$(tag_of $'latest\nnightly')"
+H1=9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
+H2=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+# sum_of SUMS: what sum_for tailnet-ap makes of the SHA256SUMS text SUMS, as "rc=STATUS [HASH]"
+sum_of() { local r; r=$(printf '%s\n' "$1" | sum_for tailnet-ap); printf 'rc=%s [%s]' "$?" "$r"; }
+same "sum_for: the line for tailnet-ap, not the one before it" "rc=0 [$H1]" \
+    "$(sum_of "$H2  README.md"$'\n'"$H1  tailnet-ap")"
+same "sum_for: sha256sum's binary-mode '*'" "rc=0 [$H1]" \
+    "$(sum_of "$H2 *README.md"$'\n'"$H1 *tailnet-ap")"
+same "sum_for: an upper-case hash, given in lower case" "rc=0 [$H1]" "$(sum_of "${H1^^}  tailnet-ap")"
+same "sum_for: no line for tailnet-ap: fails" "rc=1 []" "$(sum_of "$H2  README.md")"
+same "sum_for: tailnet-ap.bak and lib/tailnet-ap are other files: fails" "rc=1 []" \
+    "$(sum_of "$H1  tailnet-ap.bak"$'\n'"$H1  lib/tailnet-ap")"
+
+# ---- update, the whole command against a pretend GitHub ----
+section "update: only a release tag, checked against its SHA256SUMS (GitHub is a stub)"
+TAGS_FX=$'v1.1.4\nv1.10.0\nv9.9.9\nlatest\nv10.0.0-rc1'
+# updated TAGS SUMS VER [ARG]: run do_update ARG in a subshell against a pretend GitHub, and
+# print its exit status, then what it said. TAGS is the tag names, one per line. The tag
+# v9.9.9 holds tailnet-ap, this program with VERSION=VER, and a SHA256SUMS unless SUMS is
+# absent: good holds the file's real sum, bad a wrong one. fetch answers only the URLs
+# update should ask for, pinned to v9.9.9, and refuses any other; json_names passes the
+# names through, so neither the network nor python3 is used. mktemp makes its files in the
+# scratch directory. cp and install stay refused, so an install would fail the run.
+updated() {
+    local st out
+    out=$( (
+        FX=$(mktemp -d "$SCRATCH/update.XXXXXX") FX_TAGS=$1 FX_SUMS=$2
+        sed "s/^VERSION=.*/VERSION=$3/" "$LIB" > "$FX/tailnet-ap"
+        case "$FX_SUMS" in
+            good) printf '%s  tailnet-ap\n' "$(sha256sum "$FX/tailnet-ap" | cut -d' ' -f1)" > "$FX/SHA256SUMS" ;;
+            bad)  printf '%064d  tailnet-ap\n' 0 > "$FX/SHA256SUMS" ;;
+        esac
+        shift 3
+        SELF=$LIB
+        command() {
+            if [ "${1:-}" = -v ]; then
+                case "${2:-}" in curl|python3) echo "/usr/bin/$2"; return 0 ;; esac
+                return 1
+            fi
+            builtin command "$@"
+        }
+        mktemp() { command mktemp "$FX/tmp.XXXXXX"; }
+        json_names() { cat; }
+        fetch() {
+            case "$1" in
+                "$REPO_API/tags?"*) printf '%s\n' "$FX_TAGS" ;;
+                "$REPO_API/contents?ref=v9.9.9")
+                    printf 'README.md\ntailnet-ap\n'
+                    [ "$FX_SUMS" = absent ] || echo SHA256SUMS ;;
+                "$REPO_API/contents/tailnet-ap?ref=v9.9.9") cat "$FX/tailnet-ap" ;;
+                "$REPO_API/contents/SHA256SUMS?ref=v9.9.9") cat "$FX/SHA256SUMS" ;;
+                *) refused fetch "$@" ;;
+            esac
+        }
+        do_update "$@"
+    ) 2>&1 ); st=$?
+    printf '%s\n%s\n' "$st" "$out"
+}
+# upd_says TEXT ARGS...: yes when "updated ARGS" says something holding TEXT, else no
+upd_says() { local t=$1; shift; if updated "$@" | sed 1d | grep -qF -- "$t"; then echo yes; else echo no; fi; }
+same "no tags at all: update stops with status 1" 1 "$(updated "" absent 9.9.9 --check | sed -n 1p)"
+same "  and says there is no release tag" yes "$(upd_says "has no release tag" "" absent 9.9.9 --check)"
+same "a newer release with a matching SHA256SUMS: --check exits 0" 0 \
+    "$(updated "$TAGS_FX" good 9.9.9 --check | sed -n 1p)"
+same "  it takes the highest vMAJOR.MINOR.PATCH tag" yes \
+    "$(upd_says "release   : v9.9.9" "$TAGS_FX" good 9.9.9 --check)"
+same "  the download matches SHA256SUMS" yes \
+    "$(upd_says "checksum  : matches SHA256SUMS at v9.9.9" "$TAGS_FX" good 9.9.9 --check)"
+same "  and the update is offered" yes "$(upd_says "an update is available" "$TAGS_FX" good 9.9.9 --check)"
+same "a tag with no SHA256SUMS: one line says so" yes \
+    "$(upd_says "checksum  : v9.9.9 has no SHA256SUMS, so the download is not checked against one" "$TAGS_FX" absent 9.9.9 --check)"
+same "  and the update is still offered" yes "$(upd_says "an update is available" "$TAGS_FX" absent 9.9.9 --check)"
+same "a wrong SHA256SUMS: --check stops with status 1" 1 "$(updated "$TAGS_FX" bad 9.9.9 --check | sed -n 1p)"
+same "  and says the download does not match" yes \
+    "$(upd_says "does NOT match SHA256SUMS at v9.9.9" "$TAGS_FX" bad 9.9.9 --check)"
+same "a wrong SHA256SUMS: update stops with status 1, before cp or install" 1 \
+    "$(updated "$TAGS_FX" bad 9.9.9 | sed -n 1p)"
+same "  and says it refuses to install" yes "$(upd_says "refusing to install" "$TAGS_FX" bad 9.9.9)"
+same "a release older than the installed one: update stops with status 1" 1 \
+    "$(updated "$TAGS_FX" good 1.1.4 | sed -n 1p)"
+same "  and names the downgrade" yes \
+    "$(upd_says "is older than the installed one ($VERSION)" "$TAGS_FX" good 1.1.4)"
+same "  --check names it too" yes \
+    "$(upd_says "installed is newer than the remote ($VERSION > 1.1.4)" "$TAGS_FX" good 1.1.4 --check)"
+same "the release is the installed file: --check says up to date" yes \
+    "$(upd_says "up to date" "$TAGS_FX" good "$VERSION" --check)"
+same "the program never names the main branch as a ref" "" "$(grep -n 'ref=main\|commits/main' "$LIB")"
+
+# ---- doctor, the pure parts ----
+section "doctor: the AP radio, the route approval, port 53"
+IW_PHY_AP=$'Wiphy phy0\n\tmax # scan SSIDs: 4\n\tSupported interface modes:\n\t\t * IBSS\n\t\t * managed\n\t\t * AP\n\t\t * AP/VLAN\n\t\t * monitor\n\tBand 1:\n\t\tCapabilities: 0x1062'
+IW_PHY_NOAP=$'Wiphy phy1\n\tSupported interface modes:\n\t\t * managed\n\t\t * AP/VLAN\n\t\t * monitor\n\tsoftware interface modes (can always be added):\n\t\t * AP/VLAN\n\t\t * monitor\n\tvalid interface combinations:\n\t\t * #{ managed } <= 1, #{ AP, P2P-client } <= 1,\n\t\t   total <= 3, #channels <= 1'
+iw_ap() { if printf '%s\n' "$1" | iw_has_ap; then echo yes; else echo no; fi; }
+same "iw_has_ap: AP among the supported interface modes" yes "$(iw_ap "$IW_PHY_AP")"
+same "iw_has_ap: AP/VLAN only, and AP only in a combination: no" no "$(iw_ap "$IW_PHY_NOAP")"
+same "iw_has_ap: iw printed nothing" no "$(iw_ap "")"
+# "tailscale debug netmap", cut down to what route_approval reads. PrimaryRoutes holds the
+# AP subnet in both, so only the packet filter tells them apart.
+NETMAP_OK='{
+    "SelfNode": {"Name": "pi.example.ts.net.", "PrimaryRoutes": ["10.42.7.0/24"]},
+    "PacketFilter": [
+        {"IPProto": [6, 17, 1, 58],
+         "Srcs": ["100.64.0.0/10", "fd7a:115c:a1e0::/48", "10.42.7.0/24"],
+         "SrcCaps": null,
+         "Dsts": [{"Net": "100.116.252.86/32", "Ports": {"First": 0, "Last": 65535}}],
+         "Caps": []}
+    ]
+}'
+NETMAP_NO='{
+    "SelfNode": {"Name": "pi.example.ts.net.", "PrimaryRoutes": ["10.42.7.0/24"]},
+    "PacketFilter": [
+        {"IPProto": [6, 17, 1, 58],
+         "Srcs": ["100.64.0.0/10", "fd7a:115c:a1e0::/48"],
+         "SrcCaps": null,
+         "Dsts": [{"Net": "100.116.252.86/32", "Ports": {"First": 0, "Last": 65535}}],
+         "Caps": []}
+    ]
+}'
+NETMAP_ALL='{"PacketFilter": [{"IPProto": [6, 17], "Srcs": ["0.0.0.0/0", "::/0"], "Dsts": []}]}'
+# route_approval needs python3, and without it says unknown for everything, which is what
+# these expect then. The count of checks is the same either way.
+if command -v python3 >/dev/null 2>&1; then HAVE_PY=yes; else HAVE_PY=no; fi
+py_expect() { if [ "$HAVE_PY" = yes ]; then echo "$1"; else echo unknown; fi; }
+approval_of() { printf '%s\n' "$1" | route_approval 10.42.7.0/24; }
+same "route_approval: a packet-filter rule from the AP subnet: approved" \
+    "$(py_expect yes)" "$(approval_of "$NETMAP_OK")"
+same "route_approval: in PrimaryRoutes and in no rule: not approved" \
+    "$(py_expect no)" "$(approval_of "$NETMAP_NO")"
+same "route_approval: a rule from every source: cannot tell" unknown "$(approval_of "$NETMAP_ALL")"
+same "route_approval: not JSON: cannot tell, never a guess" unknown "$(approval_of "permission denied")"
+same "route_approval: no PacketFilter at all: cannot tell" unknown "$(approval_of '{"Peers": []}')"
+SS_OURS='State  Recv-Q Send-Q Local Address:Port  Peer Address:Port Process
+UNCONN 0      0      127.0.0.53%lo:53     0.0.0.0:*         users:(("systemd-resolve",pid=500,fd=13))
+UNCONN 0      0      0.0.0.0:5353         0.0.0.0:*         users:(("avahi-daemon",pid=600,fd=12))
+UNCONN 0      0      10.42.7.1:53         0.0.0.0:*         users:(("dnsmasq",pid=900,fd=6))'
+SS_NAMED='State  Recv-Q Send-Q Local Address:Port  Peer Address:Port Process
+UNCONN 0      0      127.0.0.53%lo:53     0.0.0.0:*         users:(("systemd-resolve",pid=500,fd=13))
+UNCONN 0      0      0.0.0.0:5353         0.0.0.0:*         users:(("avahi-daemon",pid=600,fd=12))
+UNCONN 0      0      0.0.0.0:53           0.0.0.0:*         users:(("named",pid=700,fd=5))'
+# held SS [PID]: what port53_holders says for 10.42.7.1 on ap0, as "rc=STATUS [HOLDERS]"
+held() { local r; r=$(printf '%s\n' "$1" | port53_holders 10.42.7.1 ap0 "${2:-}"); printf 'rc=%s [%s]' "$?" "$r"; }
+same "port53_holders: only the AP's own dnsmasq, by its pid: nothing else holds it" \
+    "rc=1 []" "$(held "$SS_OURS" 900)"
+same "port53_holders: without its pid the same socket is named" \
+    "rc=0 [10.42.7.1:53 (dnsmasq)]" "$(held "$SS_OURS")"
+same "port53_holders: a server on every address is named; loopback and 5353 are not" \
+    "rc=0 [0.0.0.0:53 (named)]" "$(held "$SS_NAMED")"
+same "port53_holders: without root ss names no process" \
+    "rc=0 [*:53 (unknown process)]" "$(held 'LISTEN 0      32     *:53      *:*')"
+
+# ---- doctor, the whole command on a pretend machine ----
+section "doctor: its exit status is the verdict, and advertised is not approved"
+# doctored [NAME=VALUE...]: run do_doctor in a subshell on a pretend machine, and print its
+# exit status, then what it printed. The machine, unless a NAME=VALUE says otherwise:
+#   HAVE      what command -v finds: hostapd dnsmasq iw nmcli tailscale ss. Not python3,
+#             so adv_routes reads with awk whatever the host has.
+#   RADIO     what ap_radio answers: yes
+#   STATE     tailscale's BackendState: Running
+#   PREFS     "tailscale debug prefs": $PREFS_NULL, no route advertised
+#   APPROVAL  what route_approval answers: no
+#   SS        "ss -lunp": nothing on port 53
+# Every command doctor runs is a stub or reads only, and the AP's pid file is not there.
+doctored() {
+    local st out
+    out=$( (
+        HAVE="hostapd dnsmasq iw nmcli tailscale ss" RADIO=yes STATE=Running
+        PREFS=$PREFS_NULL APPROVAL=no SS="" DNSMASQ_PID=$SCRATCH/none.pid
+        for kv in "$@"; do printf -v "${kv%%=*}" '%s' "${kv#*=}"; done
+        command() {
+            if [ "${1:-}" = -v ]; then
+                case " $HAVE " in *" ${2:-} "*) echo "/usr/bin/$2"; return 0 ;; esac
+                return 1
+            fi
+            builtin command "$@"
+        }
+        ap_radio() { echo "$RADIO"; }
+        route_approval() { cat >/dev/null; echo "$APPROVAL"; }
+        tailscale() {
+            case "$*" in
+                "debug prefs")   printf '%s\n' "$PREFS" ;;
+                "debug netmap")  echo '{}' ;;
+                "status --json") printf '{\n\t"Version": "1.90.0",\n\t"BackendState": "%s"\n}\n' "$STATE" ;;
+                *) refused tailscale "$@" ;;
+            esac
+        }
+        ss() {
+            case "$*" in
+                -lunp) printf '%s\n' "$SS" ;;
+                -ltnp) ;;
+                *) refused ss "$@" ;;
+            esac
+        }
+        do_doctor
+    ) 2>&1 ); st=$?
+    printf '%s\n%s\n' "$st" "$out"
+}
+# doctor_says TEXT NAME=VALUE...: yes when doctor prints something holding TEXT there, else no
+doctor_says() { local t=$1; shift; if doctored "$@" | sed 1d | grep -qF -- "$t"; then echo yes; else echo no; fi; }
+APPROVE="approve the subnet route in the Tailscale admin console"
+same "a machine with everything the AP needs: exit 0" 0 "$(doctored | sed -n 1p)"
+for t in hostapd dnsmasq iw; do
+    have=" hostapd dnsmasq iw nmcli tailscale ss "
+    same "$t missing: exit 1" 1 "$(doctored "HAVE=${have/ $t / }" | sed -n 1p)"
+done
+same "  and the verdict names what is missing" yes \
+    "$(doctor_says "NOT READY: iw is missing" "HAVE=hostapd dnsmasq nmcli tailscale ss")"
+same "tailscale missing is reported, not a failure: exit 0" 0 \
+    "$(doctored "HAVE=hostapd dnsmasq iw nmcli ss" | sed -n 1p)"
+same "no radio that can be an access point: exit 1" 1 "$(doctored RADIO=no | sed -n 1p)"
+same "HOSTIP is the network address, so no usable subnet: exit 1" 1 "$(doctored HOSTIP=10.42.7.0 | sed -n 1p)"
+same "route advertised and not approved: says to approve it" yes \
+    "$(doctor_says "$APPROVE" "PREFS=$PREFS_AP" APPROVAL=no)"
+same "route advertised and approved: does not" no "$(doctor_says "$APPROVE" "PREFS=$PREFS_AP" APPROVAL=yes)"
+same "route not advertised: does not" no "$(doctor_says "$APPROVE" "PREFS=$PREFS_NULL" APPROVAL=no)"
+same "approval cannot be read: does not" no "$(doctor_says "$APPROVE" "PREFS=$PREFS_AP" APPROVAL=unknown)"
+same "  and says it cannot tell" yes \
+    "$(doctor_says "advertised; approval unknown" "PREFS=$PREFS_AP" APPROVAL=unknown)"
+same "tailscale logged out: says so" yes "$(doctor_says "NeedsLogin: NOT logged in and running" STATE=NeedsLogin)"
+same "  a warning, not a failure: exit 0" 0 "$(doctored STATE=NeedsLogin | sed -n 1p)"
+same "something else on port 53: a warning naming it" yes "$(doctor_says "0.0.0.0:53 (named)" "SS=$SS_NAMED")"
+same "nothing else on port 53: free" yes "$(doctor_says "free for 10.42.7.1")"
+
 section "safety"
 if [ -s "$SCRATCH/refused" ]; then
     bad "nothing that changes the machine was called" "$(tr '\n' ';' < "$SCRATCH/refused")"

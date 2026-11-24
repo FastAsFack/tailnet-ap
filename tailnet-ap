@@ -3,7 +3,8 @@
 #
 #   tailnet-ap install            lay down the configs and the key (needs root)
 #   tailnet-ap uninstall [--purge]     undo install and enable (--purge: the key and settings too)
-#   tailnet-ap on [--mode cable|wifi]  bring the access point up
+#   tailnet-ap on [--mode cable|wifi] [--move-uplink]
+#                                      bring the access point up (--move-uplink: see wifi)
 #   tailnet-ap off [--handback]        bring it down
 #   tailnet-ap toggle                  on if it is down, off if it is up
 #   tailnet-ap enable                  bring the access point up at every boot
@@ -11,15 +12,21 @@
 #   tailnet-ap boot                    what the boot unit runs: on, unless the AP is already up
 #   tailnet-ap status                  what is running
 #   tailnet-ap clients                 which devices are on the access point
-#   tailnet-ap doctor                  check this machine for what the AP needs
-#   tailnet-ap update [--check|--test]  replace this program with the latest from GitHub
+#   tailnet-ap doctor                  check this machine for what the AP needs; exits 1
+#                                      when hostapd, dnsmasq, iw, an AP radio or the subnet fails
+#   tailnet-ap update [--check|--test]  replace this program with the newest release tag
+#                                      on GitHub, checked against its SHA256SUMS
 #   tailnet-ap version                 print the version
 #   tailnet-ap key                     print the wi-fi password (needs root)
 #   tailnet-ap key set PASSWORD        replace it (8 to 63 characters)
 #   tailnet-ap help                    this text
 #
 # cable: the cable is the uplink and the whole radio is the access point.
-# wifi:  the wi-fi stays the uplink and the access point shares its channel.
+# wifi:  the wi-fi stays the uplink and the access point shares its channel. The card
+#        beacons only on 2.4 GHz channels 1-13 and 5 GHz channels 149-165, so an uplink
+#        on any other channel needs --move-uplink, after --mode wifi: it moves the uplink
+#        to 2.4 GHz through a copy of its profile, whose wi-fi password must be stored in
+#        the profile file, not only in the desktop keyring. off --handback moves it back.
 #
 # Sourced by the test suite: it defines functions and runs nothing. Run as a
 # program: it dispatches the subcommand.
@@ -45,12 +52,12 @@ fi
 # writing NetworkManager profiles stay in the entry scripts, where they read top to bottom.
 
 # ---- names ----
-VERSION=1.1.4
-# The contents API, not raw.githubusercontent.com: the raw CDN served a stale copy
-# for minutes after a push. Even the contents API at ?ref=main is cached, so update
-# first reads the head SHA and pins the file URL to that commit.
+VERSION=1.2.0
+# update installs only a release tag, never the head of the main branch: it reads the
+# tags from the GitHub API and pins the file and its SHA256SUMS to the newest one. The
+# contents API, not raw.githubusercontent.com: the raw CDN served a stale copy for
+# minutes after a push.
 REPO_API=https://api.github.com/repos/FastAsFack/tailnet-ap
-REPO_RAW=$REPO_API/contents/tailnet-ap?ref=main
 # The values below are the built-in defaults. load_config, called from main, lays the
 # settings file and then any TAILNET_AP_* variable over them; sourcing does not.
 # The network name. Override with SSID in the settings file or TAILNET_AP_SSID.
@@ -1534,36 +1541,103 @@ do_update_test() {
     fi
 }
 
-# do_update [--check]: replace this program with the latest one from the repository.
-# The key and the configs are left alone; install only refreshes the drop-ins.
+# fetch URL [ACCEPT]: print what the GitHub API answers at URL, through curl or wget, with
+# the User-Agent it wants and ACCEPT as the Accept header (its JSON when not given). Fails
+# on any error, an HTTP error status included, printing nothing.
+fetch() {
+    local accept=${2:-application/vnd.github+json}
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL -H "Accept: $accept" -H "User-Agent: tailnet-ap" "$1"
+    else
+        wget -qO- --header="Accept: $accept" --header="User-Agent: tailnet-ap" "$1"
+    fi
+}
+
+# json_names: read a JSON list of objects on stdin (the tags, or a directory listing from
+# the contents API) and print each one's "name", one per line. Fails when stdin is not a
+# JSON list.
+json_names() {
+    python3 -I -c 'import json,sys; d=json.load(sys.stdin); assert isinstance(d, list); print("\n".join(e["name"] for e in d if isinstance(e, dict) and isinstance(e.get("name"), str)))' 2>/dev/null
+}
+
+# newest_tag: read tag names on stdin, one per line, and print the highest of the form
+# vMAJOR.MINOR.PATCH by sort -V. Any other name (v1.2, 1.2.0, v1.2.0-rc1, latest) is
+# ignored. Fails, printing nothing, when no name has that form.
+newest_tag() {
+    local t
+    t=$(grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)
+    [ -n "$t" ] || return 1
+    printf '%s\n' "$t"
+}
+
+# sum_for NAME: read a SHA256SUMS file, as sha256sum writes it, on stdin and print the
+# hash on the line for NAME, in lower case. sha256sum's binary-mode '*' and a leading './'
+# are allowed before the name. Fails, printing nothing, when no line has NAME and a
+# 64-digit hash.
+sum_for() {
+    awk -v n="${1:-}" '
+        { sub(/\r$/, "") }
+        NF == 2 {
+            f = $2; sub(/^\*/, "", f); sub(/^\.\//, "", f)
+            if (f == n && length($1) == 64 && $1 !~ /[^0-9A-Fa-f]/) { print tolower($1); found = 1; exit }
+        }
+        END { exit !found }'
+}
+
+# update_verdict INSTALLED CANDIDATE OLD_SUM NEW_SUM: what update does with a download
+# whose VERSION is CANDIDATE, as one word. same: the two files are identical. noversion:
+# the download has no VERSION. older: CANDIDATE sorts below INSTALLED by sort -V, and a
+# downgrade is never installed. install: anything else, a newer version or the same one
+# rebuilt. Pure, so the suite checks the no-downgrade rule without downloading anything.
+update_verdict() {
+    if [ -n "${3:-}" ] && [ "${3:-}" = "${4:-}" ]; then echo same
+    elif [ -z "${2:-}" ]; then echo noversion
+    elif [ "$(printf '%s\n%s\n' "${1:-}" "$2" | sort -V | tail -1)" != "$2" ]; then echo older
+    else echo install
+    fi
+}
+
+# do_update [--check|--test]: replace this program with the one at the newest release tag.
+# Never the head of the main branch, which any push changes and which update used to run
+# as root on every host: the tags come from the GitHub API, the highest vMAJOR.MINOR.PATCH
+# is taken (newest_tag), and the file is downloaded pinned to it. When the tag holds a
+# SHA256SUMS file the download must match its tailnet-ap line, or nothing is installed; a
+# tag without one is named and the update goes on. A downgrade is never installed
+# (update_verdict). The key and the configs are left alone; install only refreshes the
+# drop-ins. Only the first 100 tags the API lists are read.
 do_update() {
-    local check=no tmp old_sum new_sum new_ver
+    local check=no tmp old_sum new_sum new_ver tags tag files sums want verdict
     [ "${1:-}" = "--test" ] && { do_update_test; return $?; }
     [ "${1:-}" = "--check" ] && check=yes
     if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
         die "update needs curl or wget"
     fi
+    command -v python3 >/dev/null 2>&1 || die "update needs python3 to read the GitHub API"
+    tags=$(fetch "$REPO_API/tags?per_page=100&cb=$(date +%s)" 2>/dev/null | json_names) \
+        || die "could not read the release tags from $REPO_API/tags; nothing was changed"
+    tag=$(printf '%s\n' "$tags" | newest_tag) \
+        || die "the repository has no release tag (vMAJOR.MINOR.PATCH), so there is nothing to update to; nothing was changed"
+    say "release   : $tag"
+    # The tag's own file list says whether it has a SHA256SUMS, so absent is read, never
+    # inferred from a download that failed.
+    files=$(fetch "$REPO_API/contents?ref=$tag" 2>/dev/null | json_names) \
+        || die "could not list the files at $tag; nothing was changed"
     tmp=$(mktemp /tmp/tailnet-ap.XXXXXX) || die "could not make a temp file"
-    local sha url
-    if command -v curl >/dev/null 2>&1; then
-        sha=$(curl -fsSL -H "User-Agent: tailnet-ap" "$REPO_API/commits/main?cb=$(date +%s)" 2>/dev/null \
-              | python3 -c "import json,sys; print(json.load(sys.stdin).get('sha',''))" 2>/dev/null)
+    fetch "$REPO_API/contents/tailnet-ap?ref=$tag" application/vnd.github.raw > "$tmp" 2>/dev/null \
+        || { rm -f "$tmp"; die "could not download tailnet-ap at $tag; nothing was changed"; }
+    new_sum=$(sha256sum "$tmp" | awk '{print $1}')
+    if printf '%s\n' "$files" | grep -qx SHA256SUMS; then
+        sums=$(fetch "$REPO_API/contents/SHA256SUMS?ref=$tag" application/vnd.github.raw 2>/dev/null) \
+            || { rm -f "$tmp"; die "$tag has a SHA256SUMS file and it could not be downloaded; refusing to install, nothing was changed"; }
+        want=$(printf '%s\n' "$sums" | sum_for tailnet-ap) \
+            || { rm -f "$tmp"; die "SHA256SUMS at $tag has no line for tailnet-ap; refusing to install, nothing was changed"; }
+        if [ "$new_sum" != "$want" ]; then
+            rm -f "$tmp"
+            die "the download does NOT match SHA256SUMS at $tag (sha256 $new_sum, SHA256SUMS says $want); refusing to install, nothing was changed"
+        fi
+        say "checksum  : matches SHA256SUMS at $tag"
     else
-        sha=$(wget -qO- --header="User-Agent: tailnet-ap" "$REPO_API/commits/main?cb=$(date +%s)" 2>/dev/null \
-              | python3 -c "import json,sys; print(json.load(sys.stdin).get('sha',''))" 2>/dev/null)
-    fi
-    if [ -n "$sha" ]; then
-        url="$REPO_API/contents/tailnet-ap?ref=$sha"
-    else
-        url="$REPO_RAW"
-    fi
-    if command -v curl >/dev/null 2>&1; then
-        curl -fsSL -H "Accept: application/vnd.github.raw" -H "User-Agent: tailnet-ap" \
-            "$url" -o "$tmp" || { rm -f "$tmp"; die "could not download $url"; }
-    else
-        wget -qO "$tmp" --header="Accept: application/vnd.github.raw" \
-            --header="User-Agent: tailnet-ap" "$url" \
-            || { rm -f "$tmp"; die "could not download $url"; }
+        say "checksum  : $tag has no SHA256SUMS, so the download is not checked against one"
     fi
     if ! bash -n "$tmp" 2>/dev/null; then
         rm -f "$tmp"
@@ -1571,41 +1645,32 @@ do_update() {
     fi
     new_ver=$(awk -F= '/^VERSION=/ {gsub(/"/,"",$2); print $2; exit}' "$tmp")
     old_sum=$(sha256sum "$SELF" 2>/dev/null | awk '{print $1}')
-    new_sum=$(sha256sum "$tmp" | awk '{print $1}')
-    local newer=no
-    if [ -n "$new_ver" ] \
-        && [ "$(printf '%s\n%s\n' "${VERSION:-}" "$new_ver" | sort -V | tail -1)" = "$new_ver" ]; then
-        newer=yes
-    fi
+    verdict=$(update_verdict "${VERSION:-}" "$new_ver" "$old_sum" "$new_sum")
     if [ "$check" = yes ]; then
         say "installed : ${VERSION:-unknown}  ${old_sum:-unknown}"
         say "latest    : ${new_ver:-unknown}  $new_sum"
-        if [ "$old_sum" = "$new_sum" ]; then
-            say "up to date"
-        elif [ -z "$new_ver" ]; then
-            say "the remote file has no VERSION; not installing it"
-        elif [ "$newer" = no ]; then
-            say "installed is newer than the remote ($VERSION > $new_ver)"
-        else
-            say "an update is available: sudo tailnet-ap update"
-        fi
+        case "$verdict" in
+            same)      say "up to date" ;;
+            noversion) say "the remote file has no VERSION; not installing it" ;;
+            older)     say "installed is newer than the remote ($VERSION > $new_ver)" ;;
+            *)         say "an update is available: sudo tailnet-ap update" ;;
+        esac
         rm -f "$tmp"
         return 0
     fi
-    if [ "$old_sum" = "$new_sum" ]; then
-        say "already up to date ($VERSION)"
-        rm -f "$tmp"
-        return 0
-    fi
-    if [ -z "$new_ver" ]; then
-        rm -f "$tmp"
-        die "the downloaded file has no VERSION; refusing to install it"
-    fi
-    if [ "$newer" = no ]; then
-        rm -f "$tmp"
-        die "the downloaded version ($new_ver) is older than the installed one ($VERSION)"
-    fi
-    say "updating ${VERSION:-?} -> ${new_ver:-?}"
+    case "$verdict" in
+        same)
+            say "already up to date ($VERSION)"
+            rm -f "$tmp"
+            return 0 ;;
+        noversion)
+            rm -f "$tmp"
+            die "the downloaded file has no VERSION; refusing to install it" ;;
+        older)
+            rm -f "$tmp"
+            die "the downloaded version ($new_ver) is older than the installed one ($VERSION)" ;;
+    esac
+    say "updating ${VERSION:-?} -> ${new_ver:-?} ($tag)"
     cp -p "$SELF" "/usr/local/bin/tailnet-ap.bak" 2>/dev/null || true
     install -m 755 "$tmp" /usr/local/bin/tailnet-ap \
         || { rm -f "$tmp"; die "could not write /usr/local/bin/tailnet-ap"; }
@@ -1702,48 +1767,191 @@ do_clients() {
 
 
 # ---------------- doctor ----------------
-# do_doctor: what this machine has and what it is missing. The first thing to run on a
-# new Raspberry Pi, before install, so a missing package is obvious.
-do_doctor() {
-    local os ap
-    os=$(. /etc/os-release 2>/dev/null; printf '%s' "${PRETTY_NAME:-unknown}")
+# iw_has_ap: read "iw phy PHY info" on stdin and succeed when its "Supported interface
+# modes" list has AP. AP/VLAN, and AP in the valid interface combinations, do not count.
+iw_has_ap() {
+    awk '/Supported interface modes:/ { on = 1; next }
+         on && /^[ \t]*\* / { m = $0; sub(/^[ \t]*\* /, "", m); sub(/[ \t]+$/, "", m)
+                              if (m == "AP") found = 1
+                              next }
+         on { on = 0 }
+         END { exit !found }'
+}
+
+# ap_radio: can $WIFI_IF be an access point? yes or no; none when it is not a wireless
+# interface on this machine; unknown when neither nmcli nor iw can tell. nmcli's
+# WIFI-PROPERTIES.AP first, as before, then the supported interface modes of its phy in iw.
+ap_radio() {
+    local ap phy info=""
+    [ -e "/sys/class/net/$WIFI_IF/wireless" ] || { echo none; return 0; }
     ap=$(nmcli -f WIFI-PROPERTIES.AP device show "$WIFI_IF" 2>/dev/null \
          | awk -F: '{gsub(/ /,"",$2); print $2}' | head -1)
+    case "$ap" in yes|no) echo "$ap"; return 0 ;; esac
+    phy=$(cat "/sys/class/net/$WIFI_IF/phy80211/name" 2>/dev/null)
+    [ -n "$phy" ] && info=$(iw phy "$phy" info 2>/dev/null)
+    if [ -z "$info" ]; then echo unknown
+    elif printf '%s\n' "$info" | iw_has_ap; then echo yes
+    else echo no
+    fi
+}
+
+# ts_backend: tailscale's BackendState from "tailscale status --json": Running when it is
+# logged in and up; NeedsLogin, Stopped, Starting or NeedsMachineAuth when it is not.
+# Prints nothing when that cannot be read.
+ts_backend() {
+    tailscale status --json 2>/dev/null \
+        | sed -n 's/.*"BackendState"[[:space:]]*:[[:space:]]*"\([A-Za-z]*\)".*/\1/p' | head -1
+}
+
+# route_approval NET: read "tailscale debug netmap" on stdin and say whether the tailnet
+# has approved NET as a subnet route. yes: a rule in the netmap's PacketFilter has NET as
+# a source, which is what approval puts there. no: no rule has. unknown: the netmap cannot
+# be read, or a rule takes every source and so hides the answer. Advertised (the prefs'
+# AdvertiseRoutes) is not approved, and neither is PrimaryRoutes in "tailscale status
+# --json". Needs python3; without it the answer is unknown.
+route_approval() {
+    local a=""
+    if command -v python3 >/dev/null 2>&1; then
+        a=$(python3 -I -c 'import json,sys; d=json.load(sys.stdin); s={str(x) for r in (d["PacketFilter"] or []) for x in (r.get("Srcs") or [])}; print("yes" if sys.argv[1] in s else "unknown" if s & {"*", "0.0.0.0/0"} else "no")' "${1:-}" 2>/dev/null)
+    fi
+    printf '%s\n' "${a:-unknown}"
+}
+
+# port53_holders ADDR APIF [PID]: read "ss -lunp" and "ss -ltnp" on stdin and print, one
+# per line, each socket on port 53 that takes queries for ADDR: bound to ADDR itself or to
+# a wildcard (0.0.0.0, *, [::]), and not tied to an interface other than APIF. The socket
+# of process PID, the AP's own dnsmasq, is left out. Fails when there is none. Without
+# root ss names no process, so then nothing is left out.
+port53_holders() {
+    awk -v a="${1:-}" -v apif="${2:-}" -v own="${3:-}" '
+        {
+            loc = ""
+            for (i = 1; i <= NF; i++) if ($i ~ /:53$/) { loc = $i; break }
+            if (loc == "") next
+            host = loc; sub(/:53$/, "", host)
+            dev = ""
+            if (index(host, "%") > 0) {
+                dev = substr(host, index(host, "%") + 1)
+                host = substr(host, 1, index(host, "%") - 1)
+            }
+            if (dev != "" && dev != apif) next
+            if (host != a && host != "0.0.0.0" && host != "*" && host != "[::]") next
+            proc = "unknown process"; pid = ""
+            if (match($0, /users:\(\("[^"]*"/)) proc = substr($0, RSTART + 9, RLENGTH - 10)
+            if (match($0, /pid=[0-9]+/)) pid = substr($0, RSTART + 4, RLENGTH - 4)
+            if (own != "" && pid == own) next
+            print loc " (" proc ")"; n++
+        }
+        END { exit !n }'
+}
+
+# do_doctor: what this machine has, what it is missing, and a verdict. The first thing to
+# run on a new Raspberry Pi, before install, so a missing package is obvious. It exits 1
+# when something the AP cannot work without is missing or wrong: hostapd, dnsmasq or iw,
+# a radio that can be an access point, or HOSTIP and PREFIX that make no usable subnet.
+# Otherwise it exits 0, so the Desktop launcher and scripts can tell. Tailscale, the
+# subnet route and port 53 are reported, with what to do, but do not fail it: the AP
+# still comes up without them.
+do_doctor() {
+    local os ap t fails=""
+    os=$(. /etc/os-release 2>/dev/null; printf '%s' "${PRETTY_NAME:-unknown}")
+    ap=$(ap_radio)
     say "tailnet-ap doctor"
     printf "  %-12s %s\n" "os" "$os"
     printf "  %-12s %s (%s)\n" "uplink" "$UP_IF" "$( [ -e "/sys/class/net/$UP_IF" ] && echo present || echo MISSING )"
     printf "  %-12s %s (%s)\n" "wifi" "$WIFI_IF" "$( [ -e "/sys/class/net/$WIFI_IF" ] && echo present || echo MISSING )"
     printf "  %-12s %s\n" "wireless" "$( [ -e "/sys/class/net/$WIFI_IF/wireless" ] && echo yes || echo no )"
-    printf "  %-12s %s\n" "hostapd" "$(command -v hostapd || echo MISSING)"
-    printf "  %-12s %s\n" "dnsmasq" "$(command -v dnsmasq || echo MISSING)"
-    printf "  %-12s %s\n" "tailscale" "$(command -v tailscale || echo MISSING)"
-    printf "  %-12s %s\n" "iw" "$(command -v iw || echo MISSING)"
-    printf "  %-12s %s\n" "nmcli" "$(command -v nmcli || echo MISSING)"
+    for t in hostapd dnsmasq tailscale iw nmcli; do
+        if command -v "$t" >/dev/null 2>&1; then
+            printf "  %-12s %s\n" "$t" "$(command -v "$t")"
+        else
+            case "$t" in
+                hostapd|dnsmasq|iw)
+                    printf "  %-12s %s\n" "$t" "MISSING, and the AP needs it: $(pkg_hint "$t")"
+                    fails="$fails; $t is missing" ;;
+                *)  printf "  %-12s %s\n" "$t" "MISSING" ;;
+            esac
+        fi
+    done
     printf "  %-12s %s\n" "firewall" "$(fw_backend)"
     printf "  %-12s %s\n" "country" "$COUNTRY"
-    printf "  %-12s %s\n" "ap capable" "${ap:-unknown (needs nmcli)}"
-    local routeall adv ap_adv ap_net
+    case "$ap" in
+        yes)  printf "  %-12s %s\n" "ap capable" "yes" ;;
+        no)   printf "  %-12s %s\n" "ap capable" "NO: $WIFI_IF cannot be an access point"
+              fails="$fails; no AP-capable radio" ;;
+        none) printf "  %-12s %s\n" "ap capable" "NO: there is no wireless interface $WIFI_IF here"
+              fails="$fails; no AP-capable radio" ;;
+        *)    printf "  %-12s %s\n" "ap capable" "unknown: neither nmcli nor iw could tell for $WIFI_IF"
+              fails="$fails; no radio shown to be AP-capable" ;;
+    esac
+    local routeall adv ap_net state holders own
     # The route on adds and off withdraws: the network of HOSTIP/PREFIX, not just a /24.
     if ap_subnet; then
         ap_net=$AP_NET
     else
         ap_net=$HOSTIP/$PREFIX
         printf "  %-12s %s\n" "ap subnet" "UNUSABLE: $ap_net (HOSTIP must be a host address in it, PREFIX 8 to 30)"
+        fails="$fails; HOSTIP=$HOSTIP PREFIX=$PREFIX is not a usable subnet"
     fi
-    routeall=$(tailscale debug prefs 2>/dev/null | grep -o '"RouteAll": [a-z]*' | awk '{print $2}')
-    adv=$(adv_routes)
-    printf "  %-12s %s\n" "accept-routes" "${routeall:-unknown}"
-    case ",$adv," in
-        *",$ap_net,"*) printf "  %-12s %s\n" "subnet route" "$ap_net"; ap_adv=yes ;;
-        *) printf "  %-12s %s\n" "subnet route" "none"; ap_adv=no ;;
-    esac
-    if [ "${routeall:-}" = false ]; then
-        printf "  %-12s %s\n" "" "this device cannot reach AP clients in $ap_net"
-        printf "  %-12s %s\n" "" "fix: tailscale set --accept-routes"
+    # The AP's dnsmasq answers DNS on HOSTIP:53. Another server on that address, or on
+    # every address, can keep it from binding, and the clients then get no DNS. The AP's
+    # own dnsmasq, by its pid file, is not counted.
+    own=$(cat "$DNSMASQ_PID" 2>/dev/null)
+    if ! command -v ss >/dev/null 2>&1; then
+        printf "  %-12s %s\n" "port 53" "unknown: there is no ss to check with"
+    elif holders=$({ ss -lunp; ss -ltnp; } 2>/dev/null | port53_holders "$HOSTIP" "$AP_IF" "$own"); then
+        printf "  %-12s %s\n" "port 53" "WARNING: already held for $HOSTIP, so the AP's dnsmasq may not start:"
+        printf '%s\n' "$holders" | while IFS= read -r t; do printf "  %-12s %s\n" "" "$t"; done
+        case "$holders" in
+            *"(unknown process)"*)
+                printf "  %-12s %s\n" "" "ss names no process without root, so one may be the AP's own: sudo tailnet-ap doctor" ;;
+        esac
+    else
+        printf "  %-12s %s\n" "port 53" "free for $HOSTIP"
     fi
-    if [ "$ap_adv" = yes ]; then
-        printf "  %-12s %s\n" "" "approve the subnet route in the Tailscale admin console"
+    if ! command -v tailscale >/dev/null 2>&1; then
+        printf "  %-12s %s\n" "ts backend" "tailscale is not installed, so clients reach this host only"
+        printf "  %-12s %s\n" "" "install it first:  $(pkg_hint tailscale) && tailscale up"
+    else
+        state=$(ts_backend)
+        case "$state" in
+            Running) printf "  %-12s %s\n" "ts backend" "Running: logged in and up" ;;
+            "")      printf "  %-12s %s\n" "ts backend" "unknown: tailscale status --json could not be read (is tailscaled running?)" ;;
+            *)       printf "  %-12s %s\n" "ts backend" "$state: NOT logged in and running, so clients reach this host only"
+                     printf "  %-12s %s\n" "" "fix: sudo tailscale up" ;;
+        esac
+        routeall=$(tailscale debug prefs 2>/dev/null | grep -o '"RouteAll": [a-z]*' | awk '{print $2}')
+        printf "  %-12s %s\n" "accept-routes" "${routeall:-unknown}"
+        if ! adv=$(adv_routes); then
+            printf "  %-12s %s\n" "subnet route" "unknown: the advertised routes could not be read (tailscale debug prefs)"
+        else
+            case ",$adv," in
+                *",$ap_net,"*)
+                    # Advertised is not approved. Only an approved route reaches the packet
+                    # filter, so that is what decides, and a filter that cannot be read is
+                    # said to be unreadable rather than taken either way.
+                    case "$(tailscale debug netmap 2>/dev/null | route_approval "$ap_net")" in
+                        yes) printf "  %-12s %s\n" "subnet route" "$ap_net, advertised and approved" ;;
+                        no)  printf "  %-12s %s\n" "subnet route" "$ap_net, advertised, NOT approved"
+                             printf "  %-12s %s\n" "" "approve the subnet route in the Tailscale admin console" ;;
+                        *)   printf "  %-12s %s\n" "subnet route" "$ap_net, advertised; approval unknown"
+                             printf "  %-12s %s\n" "" "the packet filter in 'tailscale debug netmap' could not be read (try: sudo tailnet-ap doctor)"
+                             printf "  %-12s %s\n" "" "or allows every source; the Tailscale admin console shows whether it is approved" ;;
+                    esac ;;
+                *) printf "  %-12s %s\n" "subnet route" "none" ;;
+            esac
+        fi
+        if [ "${routeall:-}" = false ]; then
+            printf "  %-12s %s\n" "" "this device cannot reach AP clients in $ap_net"
+            printf "  %-12s %s\n" "" "fix: tailscale set --accept-routes"
+        fi
     fi
+    if [ -n "$fails" ]; then
+        printf "  %-12s %s\n" "result" "NOT READY: ${fails#; }"
+        return 1
+    fi
+    printf "  %-12s %s\n" "result" "ok: hostapd, dnsmasq, iw, an AP-capable radio and a usable subnet"
+    return 0
 }
 
 # do_key [set PASSWORD]
@@ -1831,8 +2039,9 @@ main() {
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
     SELF=$(readlink -f "$0")
     # help, status and doctor only read. Everything else changes the machine and needs root.
+    # Their exit status is passed on: doctor's is its verdict.
     case "${1:-help}" in
-        help|-h|--help|status|doctor|version|--version|-V) main "$@"; exit 0 ;;
+        help|-h|--help|status|doctor|version|--version|-V) main "$@"; exit $? ;;
         update)
             # --check and --test only read and write /tmp; they change nothing.
             case "${2:-}" in
