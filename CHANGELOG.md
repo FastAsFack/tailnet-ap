@@ -7,6 +7,53 @@ changed, and how it was checked. The program prints its own version with
 Versions are `MAJOR.MINOR.PATCH`. `1.1.0` is the first release that runs outside
 Fedora.
 
+## 1.2.1 - 2026-11-24
+
+Two fixes found by running 1.2.0 on a Raspberry Pi, and a corrected 1.2.0 entry.
+
+- **`install` writes the interfaces this host has into the settings file.** The
+  text of `/etc/tailnet-ap.conf` was made in `load_config`, before
+  `detect_ifaces`, so on a Pi the file said `UP_IF=enp0s31f6` and
+  `WIFI_IF=wlp3s0`, the ThinkPad's names, on a host with `eth0` and `wlan0`. It
+  worked only because detection swapped them again at every run, but the file
+  the operator reads and edits named interfaces that are not there. The text is
+  now made in `install_settings`, the settings step of `install`, after
+  detection, so on a Pi the file says `eth0` and `wlan0`. `DESKTOP_USER` is
+  still written as it was read, so an empty one is still detected at each run.
+  An existing settings file is still never overwritten, so a host installed with
+  1.2.0 keeps its file, which works as it did; to correct it, set `UP_IF` and
+  `WIFI_IF` in it by hand.
+- **`off` and `disable` give the Wi-Fi back only when the AP took it.** `off`
+  reconnected `WIFI_IF` whenever it was not connected, so on a Pi in cable mode,
+  whose Wi-Fi was never the uplink and may have no profile at all, it printed
+  `giving the wi-fi back` and then `warning: the wi-fi did not come back by
+  itself`. `on` now notes in `/var/lib/tailnet-ap/on-record` the mode, whether
+  it moved the uplink to the 2.4 GHz copy, and whether the Wi-Fi was connected
+  when the AP took the radio. `off` reads it (`wifi_taken`), reconnects only a
+  Wi-Fi the AP took, and removes the record. Cable mode on a host whose Wi-Fi
+  was connected, as on the ThinkPad, still gets it back. With no record, as for
+  an AP brought up by 1.2.0, `off` reconnects only when the copy
+  `tailnet-ap-uplink` exists. `off --handback` is unchanged: it gives the Wi-Fi
+  back whenever it is not connected, record or not.
+- **The 1.2.0 entry's "Not checked yet" paragraph is corrected.** It listed as
+  unchecked much that the run on a Raspberry Pi has since proven. It now says
+  how each was proven, and names only what is still unproven.
+
+Checked: `bash tests/run-tests.sh` has 203 checks, all offline. Added: the
+settings file `install_settings` writes after detection has found `eth0` and
+`wlan0` names them, not `enp0s31f6` and `wlp3s0`, and leaves `DESKTOP_USER`
+empty; `off` after cable mode on a host whose Wi-Fi was never connected asks
+NetworkManager to connect nothing and prints neither line, while
+`off --handback` there still reconnects it; and `off` after cable mode took a
+connected Wi-Fi still gives it back. The suite's pretend NetworkManager now
+also answers the device list `off` prints at the end.
+
+Both fixes were then run on a real host, a Raspberry Pi in cable mode, and both
+hold there: `install` wrote `/etc/tailnet-ap.conf` with `UP_IF=eth0` and
+`WIFI_IF=wlan0` rather than the ThinkPad's names, and a plain `off` printed
+neither the Wi-Fi line nor the warning (`off --handback` still gave the Wi-Fi
+back). The same run checked the rest of the list below.
+
 ## 1.2.0 - 2026-11-23
 
 The release for hosts that are not the author's. The settings live in a file
@@ -145,17 +192,32 @@ against a stubbed GitHub (no tags, a matching, missing and wrong `SHA256SUMS`, a
 older file, the same file); `iw_has_ap`, `route_approval` and `port53_holders`;
 and `do_doctor`'s exit status and messages on a stubbed machine.
 
-Not checked yet. None of this release is recorded as run on a real host:
-`load_config` and the settings step of `install`; the run lock; `ap_subnet`,
-which is not in the suite, with anything but the defaults; `on` and `off`
-changing the advertised routes on a live tailnet; the private dnsmasq; `enable`,
-`disable`, `boot` and `uninstall`; `update` against the real GitHub API, where no
-tag holds a `SHA256SUMS` yet, so the first one that does is the first real test
-of the check; whether a real netmap's `PacketFilter` carries the AP subnet once
-the route is approved, which `route_approval` relies on; and `ap_radio`'s `iw`
-fallback on a host without nmcli. `route_approval`'s parsing is checked only
-where the host running the suite has `python3`; without it the suite checks that
-it says `unknown`.
+Checked on a real host after the release (corrected in 1.2.1: this paragraph
+first said none of the release had run on one). The host is a Raspberry Pi in
+cable mode, with `eth0` as the uplink and `wlan0` as the AP radio, on a live
+tailnet where it is an exit node advertising `0.0.0.0/0` and `::/0`. There
+`install` wrote `/etc/tailnet-ap.conf` and the AP's units and dnsmasq config,
+which the runs below used (the file named the ThinkPad's interfaces, fixed in
+1.2.1); `on` added the AP subnet `10.42.7.0/24` to the advertised routes and
+`off` withdrew it, and `0.0.0.0/0` and `::/0` survived both; the AP's own
+dnsmasq ran with its own `-C` config and its own lease file, bound
+`10.42.7.1:53` and not `127.0.0.1:53`, and DNS through the AP answered A
+records, filtered AAAA and resolved a MagicDNS name; `enable`, `disable` and
+`uninstall --purge` ran (`off` and `disable` printed a needless Wi-Fi warning,
+fixed in 1.2.1); and `update` ran against the real GitHub API, on a tag that
+carries `SHA256SUMS`, and checked the download against it.
+
+Not checked yet: a real device joining the SSID, since no Wi-Fi client was at
+hand; `ap_radio`'s `iw` fallback on a host without nmcli; and `boot` bringing
+the AP up at an actual power-on boot (the boot unit was started by hand there
+and did bring the AP up). Everything else in the list above the run was also
+checked on the Pi: the run lock turned a second run away with its message and
+exit 1; `ap_subnet` derived `10.99.0.0/25`, `192.168.50.0/26` and the defaults
+correctly and refused a network address and a bad prefix; and `route_approval`
+reads a real netmap's `PacketFilter`, which does carry `10.42.7.0/24` once the
+route is approved. `route_approval`'s parsing is checked only where the host
+running the suite has `python3`; without it the suite checks that it says
+`unknown`.
 
 ## 1.1.4 - 2026-11-21
 

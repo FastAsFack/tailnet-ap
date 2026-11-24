@@ -140,6 +140,8 @@ pretend_nm() {
         case "$*" in
             "-t -f DEVICE,STATE dev status")
                 if [ -n "$LIVE" ]; then echo "$WIFI_IF:connected"; else echo "$WIFI_IF:disconnected"; fi ;;
+            "-t -f DEVICE,STATE,CONNECTION dev status")
+                if [ -n "$LIVE" ]; then echo "$WIFI_IF:connected:$LIVE"; else echo "$WIFI_IF:disconnected:"; fi ;;
             "-t -f NAME,DEVICE con show --active")
                 [ -z "$LIVE" ] || [ "$BLANK" = yes ] || echo "$LIVE:$WIFI_IF" ;;
             "-t -f UUID,DEVICE con show --active")
@@ -915,6 +917,56 @@ same "tailscale logged out: says so" yes "$(doctor_says "NeedsLogin: NOT logged 
 same "  a warning, not a failure: exit 0" 0 "$(doctored STATE=NeedsLogin | sed -n 1p)"
 same "something else on port 53: a warning naming it" yes "$(doctor_says "0.0.0.0:53 (named)" "SS=$SS_NAMED")"
 same "nothing else on port 53: free" yes "$(doctor_says "free for 10.42.7.1")"
+
+# ---- install: the settings file ----
+section "install writes the settings file with the interfaces detection found"
+# settings_written: run load_config, then install_settings (install's settings step), in a
+# subshell with no settings file yet and no TAILNET_AP_* variable. Between the two, UP_IF,
+# WIFI_IF and DESKTOP_USER are set the way detect_ifaces and detect_desktop_user set them
+# on a Raspberry Pi, which this host need not be. $CONFFILE is in the scratch directory.
+# Prints the UP_IF, WIFI_IF and DESKTOP_USER lines of the file written, on one line.
+settings_written() {
+    ( CONFFILE=$(mktemp -d "$SCRATCH/conf.XXXXXX")/tailnet-ap.conf
+      unset TAILNET_AP_SSID TAILNET_AP_COUNTRY TAILNET_AP_HOSTRECORD TAILNET_AP_UPLINK \
+            TAILNET_AP_WIFI TAILNET_AP_USER
+      load_config
+      UP_IF=eth0 WIFI_IF=wlan0 DESKTOP_USER=pi
+      install_settings >/dev/null
+      grep -E '^(UP_IF|WIFI_IF|DESKTOP_USER)=' "$CONFFILE" | paste -sd' ' - )
+}
+same "the file names the detected eth0 and wlan0, not enp0s31f6 and wlp3s0; DESKTOP_USER stays as read" \
+    "UP_IF=eth0 WIFI_IF=wlan0 DESKTOP_USER=" "$(settings_written)"
+
+# ---- off: the wi-fi goes back only when the AP took it ----
+section "off gives the wi-fi back only when the AP took it, or when --handback asks"
+# after_off WAS_UP [ARG]: run do_off ARG in a subshell after cable mode, whose record says
+# WAS_UP (yes or no) for whether the wi-fi was connected when the AP took the radio.
+# wlp3s0 is disconnected and there is no 2.4 GHz copy; the pretend NetworkManager brings
+# HomeNet up on "dev connect". The firewall, systemd, iw and tailscale (no routes) are
+# stubs, and AP_IF names no interface, so off finds no ap0 to delete. Prints what
+# NetworkManager was asked to bring up, whether off said it was giving the wi-fi back,
+# whether it warned that the wi-fi did not come back, and whether the record is gone.
+after_off() {
+    ( STATEDIR=$(mktemp -d "$SCRATCH/state.XXXXXX"); ON_RECORD=$STATEDIR/on-record
+      OUT=$(mktemp "$SCRATCH/off.XXXXXX") AP_IF=tnaptest0
+      pretend_nm "" absent
+      fw_remove() { :; }; systemctl() { return 1; }; iw() { :; }
+      tailscale() {
+          [ "$*" = "debug prefs" ] || { refused tailscale "$@"; return; }
+          printf '%s\n' "$PREFS_NULL"
+      }
+      write_on_record cable no "$1"; shift
+      do_off "$@" > "$OUT" 2>&1
+      said() { if grep -qF -- "$1" "$OUT"; then echo yes; else echo no; fi; }
+      printf 'tried=%s gave-back=%s warned=%s record=%s' "${TRIED:-none}" \
+          "$(said "giving the wi-fi back")" "$(said "warning: the wi-fi did not come back")" \
+          "$(if [ -e "$ON_RECORD" ]; then echo kept; else echo gone; fi)" )
+}
+same "off after cable mode, the wi-fi never up (a Pi): no connect, no 'giving the wi-fi back'; --handback still does" \
+    "off: tried=none gave-back=no warned=no record=gone | off --handback: tried=HomeNet gave-back=yes warned=no record=gone" \
+    "off: $(after_off no) | off --handback: $(after_off no --handback)"
+same "off after cable mode took a connected wi-fi (the ThinkPad): it is still given back" \
+    "tried=HomeNet gave-back=yes warned=no record=gone" "$(after_off yes)"
 
 section "safety"
 if [ -s "$SCRATCH/refused" ]; then

@@ -253,7 +253,7 @@ masquerades them, so they appear as the AP host.
 bash tests/run-tests.sh
 ```
 
-200 checks, no root needed. The suite sources the program
+203 checks, no root needed. The suite sources the program
 (`lib/tailnet-ap-lib.sh` is a symlink to it), uses stubs, and never touches the
 real radio or the network.
 

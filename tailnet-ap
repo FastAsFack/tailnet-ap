@@ -52,7 +52,7 @@ fi
 # writing NetworkManager profiles stay in the entry scripts, where they read top to bottom.
 
 # ---- names ----
-VERSION=1.2.0
+VERSION=1.2.1
 # update installs only a release tag, never the head of the main branch: it reads the
 # tags from the GitHub API and pins the file and its SHA256SUMS to the newest one. The
 # contents API, not raw.githubusercontent.com: the raw CDN served a stale copy for
@@ -97,6 +97,10 @@ BOOT_UNIT=tailnet-ap-boot
 # What install itself added to the firewalld zone, so uninstall takes away that and no more.
 STATEDIR=/var/lib/tailnet-ap
 FW_ADDED=$STATEDIR/firewalld-added
+# What 'on' did to the wi-fi, for 'off': the mode, whether it moved the uplink to the
+# 2.4 GHz copy, and whether the wi-fi was connected when the AP took the radio. 'off'
+# reads it to know whether there is a wi-fi to give back, then removes it.
+ON_RECORD=$STATEDIR/on-record
 NMDIR=/etc/NetworkManager/system-connections
 HOSTAPD_CONF=/etc/hostapd/tailnet-ap.conf
 # The user who owns the desktop. On the ThinkPad that is tijnb, not the admin hermes;
@@ -132,8 +136,8 @@ conf_text() {
 # /etc/tailnet-ap.conf - the settings for tailnet-ap.
 #
 # 'tailnet-ap install' writes this file once, from the built-in defaults plus any
-# TAILNET_AP_* variable set at that moment. A later install or update keeps it as it
-# is, so edits made here stay.
+# TAILNET_AP_* variable set at that moment, with UP_IF and WIFI_IF as found on this
+# machine. A later install or update keeps it as it is, so edits made here stay.
 #
 # Plain KEY=value lines, no quotes: everything after the first = is the value. An
 # empty value means the built-in default. A TAILNET_AP_* variable still overrides a
@@ -153,8 +157,8 @@ HDR
 # for this run only. An empty value in the file keeps the default, and a line that is
 # not one of $CONF_KEYS is reported and ignored. The file is parsed, never sourced.
 # Called from main before detection, never at source time, so sourcing this file reads
-# nothing from the host. It also keeps the settings as they are before detection fills
-# anything in, in CONF_TEXT, which is what install writes.
+# nothing from the host. It also keeps DESKTOP_USER as it is before detection fills it
+# in, in CONF_DESKTOP_USER, which is what install_settings writes for it.
 load_config() {
     local line key val
     if [ -r "$CONFFILE" ]; then
@@ -178,7 +182,7 @@ load_config() {
     [ -n "${TAILNET_AP_UPLINK:-}" ]     && UP_IF=$TAILNET_AP_UPLINK
     [ -n "${TAILNET_AP_WIFI:-}" ]       && WIFI_IF=$TAILNET_AP_WIFI
     [ -n "${TAILNET_AP_USER:-}" ]       && DESKTOP_USER=$TAILNET_AP_USER
-    CONF_TEXT=$(conf_text)
+    CONF_DESKTOP_USER=$DESKTOP_USER
 }
 
 # detect_ifaces: swap in the real interface names when the compiled-in defaults are not
@@ -616,6 +620,35 @@ dnsmasq_leases() {
     fi
 }
 
+# ---- what on did to the wi-fi, for off ----
+# on_record KEY: the value of KEY (mode, moved_uplink or wifi_was_up) in $ON_RECORD, or
+# nothing when there is no record or no such line.
+on_record() { sed -n "s/^$1=//p" "$ON_RECORD" 2>/dev/null | head -1; }
+
+# write_on_record MODE MOVED WIFI_WAS_UP: note in $ON_RECORD what this on did: cable or
+# wifi, whether it moved the uplink to the 2.4 GHz copy, and whether the wi-fi was
+# connected when the AP took the radio, each yes or no. A yes stays yes until off removes
+# the record: an on run again over a live AP finds the wi-fi already gone, taken by the first.
+write_on_record() {
+    local moved=$2 was=$3
+    [ "$(on_record moved_uplink)" = yes ] && moved=yes
+    [ "$(on_record wifi_was_up)" = yes ] && was=yes
+    [ -d "$STATEDIR" ] || install -d -m 755 "$STATEDIR"
+    printf 'mode=%s\nmoved_uplink=%s\nwifi_was_up=%s\n' "$1" "$moved" "$was" > "$ON_RECORD"
+}
+
+# wifi_taken: did the AP take the wi-fi, so that off owes it a reconnect? With a record:
+# when it says the wi-fi was connected when the AP took the radio, or that on moved the
+# uplink. With none (an AP brought up by 1.2.0, or no AP at all): only when the 2.4 GHz
+# copy $UPLINK_CON exists.
+wifi_taken() {
+    if [ -e "$ON_RECORD" ]; then
+        [ "$(on_record wifi_was_up)" = yes ] || [ "$(on_record moved_uplink)" = yes ]
+    else
+        nmcli -t -f NAME con show 2>/dev/null | grep -qx "$UPLINK_CON"
+    fi
+}
+
 stop_ap() {
     # The rules a previous run left name the uplink of its mode, which need not be this
     # run's, so drop them for each interface that can be the uplink.
@@ -809,8 +842,11 @@ if [ "$MODE" = cable ]; then
 
     # Free the radio. One radio cannot hold a client link and an AP on another channel, and
     # "dev disconnect" also stops NetworkManager from taking the device back while the AP is
-    # up: it clears the device's autoconnect until something connects it explicitly. The off
-    # script always tries to give the wi-fi back, so this is not a one-way door.
+    # up: it clears the device's autoconnect until something connects it explicitly. The
+    # record says whether the wi-fi was connected here: off gives back a wi-fi this took, so
+    # this is not a one-way door, and leaves alone one that never was (a Pi on its cable,
+    # maybe with no wi-fi profile at all).
+    if wifi_connected; then write_on_record cable no yes; else write_on_record cable no no; fi
     nmcli dev disconnect "$WIFI_IF" >/dev/null 2>&1
     for _ in $(seq 1 10); do
         wifi_connected || break
@@ -859,6 +895,8 @@ else
             exit 1
         fi
         say "uplink is on channel $CH, which this card cannot beacon on. Moving it to 2.4 GHz."
+        # for off, before anything moves: the uplink goes to the 2.4 GHz copy
+        write_on_record wifi yes yes
         # what restore_uplink brings back if the move fails
         ORIG_UUID=$(orig_uuid)
         if ! pin_uplink_24; then
@@ -869,6 +907,8 @@ else
     fi
     ap_capable "$CH" || die "uplink ended up on channel $CH, still not beaconable"
 
+    # for off: in wifi mode the wi-fi is the uplink, connected when the AP joined its radio
+    write_on_record wifi no yes
     start_ap_on "$CH" wifi
 
     say "mode        : wifi, wi-fi is the uplink and the AP rides its channel"
@@ -909,9 +949,10 @@ do_off() {
 parse_off_args "$@"
 
 # The firewall rules on added name the active uplink: the cable in cable mode, the wi-fi
-# in wifi mode. off cannot know which mode on ran in, so, as stop_ap does, it drops them
-# for each interface that can be the uplink. Without this, iptables and nft kept NAT and
-# FORWARD rules for an ap0 that was gone.
+# in wifi mode. off cannot always know which mode on ran in (an AP brought up by 1.2.0
+# left no record), so, as stop_ap does, it drops them for each interface that can be the
+# uplink. Without this, iptables and nft kept NAT and FORWARD rules for an ap0 that was
+# gone.
 fw_remove "$UP_IF"
 [ "$WIFI_IF" = "$UP_IF" ] || fw_remove "$WIFI_IF"
 
@@ -961,10 +1002,13 @@ if nmcli -t -f NAME con show 2>/dev/null | grep -qx "$UPLINK_CON"; then
     fi
 fi
 
-# The AP is gone. In cable mode the radio was taken away from the wi-fi client by design, so
-# give it back: after this, the laptop must never be left with no wireless at all. In wifi mode
-# the uplink is the wi-fi itself and is still connected, so this is a no-op.
-if ! wifi_connected; then
+# The AP is gone. Give the wi-fi back when the AP took it (wifi_taken, from the record on
+# wrote) or when --handback asks: the laptop must never be left with no wireless at all.
+# Cable mode takes a connected wi-fi off the radio by design, and its record says so. A
+# wi-fi that was never connected, as on a Pi on its cable with maybe no wi-fi profile at
+# all, was not the AP's to give back, and trying only printed a warning. In wifi mode the
+# uplink is the wi-fi itself and is still connected, so this is a no-op.
+if ! wifi_connected && { [ "$HANDBACK" = yes ] || wifi_taken; }; then
     echo "giving the wi-fi back"
     nmcli dev connect "$WIFI_IF" >/dev/null 2>&1
     for _ in $(seq 1 10); do
@@ -974,6 +1018,8 @@ if ! wifi_connected; then
     done
     wifi_connected || echo "warning: the wi-fi did not come back by itself. Run:  nmcli dev connect $WIFI_IF"
 fi
+# Spent: the next on writes its own.
+rm -f "$ON_RECORD"
 
 # Withdraw the AP subnet from the tailnet, and only it: every other route this host
 # advertises is set back as it was. It comes after the wi-fi is back, so a slow or hung
@@ -1074,6 +1120,22 @@ do_disable() {
 }
 
 # ---------------- install ----------------
+# install_settings: install's settings step. Written once, like the key: an existing
+# $CONFFILE is kept as it is, so an operator's settings are never silently replaced. The
+# text is made here, after detect_ifaces, so UP_IF and WIFI_IF are the interfaces this
+# machine has (eth0 and wlan0 on a Pi). Up to 1.2.0 it was made before detection and named
+# the ThinkPad's enp0s31f6 and wlp3s0 on every host. DESKTOP_USER is written as load_config
+# read it, so an empty one is still detected at each run.
+install_settings() {
+    if [ -e "$CONFFILE" ]; then
+        say "  keeping the existing settings in $CONFFILE"
+    else
+        ( DESKTOP_USER=${CONF_DESKTOP_USER:-}; conf_text ) > "$CONFFILE"
+        chmod 644 "$CONFFILE"
+        say "  $CONFFILE written"
+    fi
+}
+
 # Lays down what the access point needs on disk. Mirrors the tested deploy.sh:
 # the same four drop-ins, the same firewall changes, the same key handling.
 do_install() {
@@ -1263,15 +1325,7 @@ CONF
     fi
 
     say "install: settings"
-    # Written once, like the key: an operator's settings are never silently replaced.
-    # CONF_TEXT is the defaults plus any TAILNET_AP_* variable, from load_config.
-    if [ -e "$CONFFILE" ]; then
-        say "  keeping the existing settings in $CONFFILE"
-    else
-        printf '%s\n' "$CONF_TEXT" > "$CONFFILE"
-        chmod 644 "$CONFFILE"
-        say "  $CONFFILE written"
-    fi
+    install_settings
 
     say "install: network key"
     if [ -s "$PSKFILE" ]; then
